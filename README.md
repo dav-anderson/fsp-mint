@@ -6,16 +6,26 @@ FSP is the fast point. Each JAMJAR service issues its own FSP from its own copy 
 
 Not started. This file records plans for the foundation.
 
-## Accepting PSP as well as ESP
+## Units
 
-When the ESP issuer is offline, an app can trade PSP directly for a service's FSP, so fsp-mint accepts both.
+FSP uses the same unit as ESP: 10^-12 USD per unit. ESP to FSP is 1:1, so a service issues one FSP unit for each ESP unit it transfers. (1 PSP is worth 1 USD, which is 10^12 ESP.) Services price in whole units. There is no smaller unit and no fractional FSP.
 
-- **From ESP.** The service transfers the notes at the ESP mint (see the esp-mint README) and issues FSP once the transfer succeeds.
-- **From PSP.** The same pattern at the PSP mint. The app hands over the notes and their spend secrets. The service sends them through the PSP's `/swap` with fresh outputs of its own, so only the service controls the result. The difference between inputs and outputs is the fee. The service issues FSP once the swap succeeds.
-- **Redeeming PSP later.** PSP-funded FSP has no encumbrance period. The service later redeems the PSP it holds at the PSP mint and is paid in bitcoin. The PSP has no payout path yet, because the core `melt` only burns.
-- **Needs.** The PSP's HTTP API running in-process, and a client in fsp-mint for each upstream mint.
+- Amounts are `u64`, so one note is worth at most about 1.8e19 units, which is about $18.4 million.
+- Every sum is computed in `u128` or with checked arithmetic, so an overflow is an error and never wraps. Tests cover the limits: `u64::MAX` amounts, sums that exceed one note, and a price times a quantity near the limit.
+- The unit constants and checked helpers are in esp-mint (`src/units.rs`). Share them with this crate when it is built.
+
+## Accepting ESP
+
+fsp-mint issues FSP in exchange for ESP only. PSP cannot be traded directly for FSP.
+
+- **From ESP.** The service transfers the notes at the ESP mint (see the esp-mint README) and issues FSP once the transfer succeeds. The transfer is a JAMJAR message, and its cost is paid in JAMJAR currency and charged by JAMJAR messaging.
+- **Needs.** A client in fsp-mint for the ESP mint's transfer request.
+
+## Fees
+
+Each service sets its own FSP fees in its own FSP mint. The mints charge no fee for the exchange or transfer that leads to FSP.
 
 ## Left to do
 
 - **Hot-path performance.** One global mutex and a disk write per spend cannot reach a thousand requests a second. The plan is an in-memory spent set with batched writes. A crash can lose an unflushed batch, which opens a small replay window.
-- **Accepting ESP and PSP**, as above.
+- **Accepting ESP**, as above.
