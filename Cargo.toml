@@ -2,10 +2,11 @@
 name = "fsp-mint"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 
 [dependencies]
-mint-core = { git = "https://github.com/dav-anderson/mint-core" }
-mint-types = { git = "https://github.com/dav-anderson/mint-core" }
-bdhke = { git = "https://github.com/dav-anderson/mint-core" }
-sandbox-mint-server = { git = "https://github.com/dav-anderson/mint-core" }
+mint-core = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.2" }
+mint-types = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.2" }
+bdhke = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.2" }
+mint-server = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.2" }
