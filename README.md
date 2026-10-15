@@ -30,3 +30,5 @@ Each service sets its own FSP fees in its own FSP mint. The mints charge no fee 
 - **Hot-path performance.** One global mutex and a disk write per spend cannot reach a thousand requests a second. The plan is an in-memory spent set with batched writes. A crash can lose an unflushed batch, which opens a small replay window.
 - **Accepting ESP**, as above.
 - **Local store is for development.** The mint's database (sled) is on local disk only while the other pieces are built. It will eventually be stored in the JAMJAR. Until then: only one process can open the mint, so there is one instance and an outage while it restarts; a live `db/` must not be copied as a backup (stop the process first, or the copy may be inconsistent); and the data directory is on local disk, so losing it loses the keys and the state.
+- **Mint keystore (deferred to the AIR).** The mint's keys move into the AIR. How they are protected there is not decided.
+- **API over the AIR (deferred).** All mint API calls will travel over the AIR. HTTP is the development transport.
