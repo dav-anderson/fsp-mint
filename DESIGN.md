@@ -103,3 +103,15 @@ Fees are charged on requests that carry value. A junk request that carries no va
 ## `GET /rotation`
 
 *Why public:* a holder needs to know when its notes stop being good. psp-mint and esp-mint have the same query, in the same shape.
+
+## Running as a service
+
+`fsp-mint serve` runs under `launchd` (macOS) or `systemd` (Linux) as a user that is not root, with its data directory (`FSP_DATA_DIR`), settings file (`FSP_CONFIG`) and network (`FSP_NETWORK`) named in an env file. The definitions, the install and uninstall steps and the health monitor are in [OPERATIONS.md](../sandbox-mint/OPERATIONS.md) (in `sandbox-mint`).
+
+**Failure and restart.** `serve` exits with status 1 if it cannot reach the ESP mint at startup (to check the network), cannot open its data or cannot bind its address, and the service manager starts it again after a delay (growing under systemd, fixed under launchd) and never gives up. It does not wait for the ESP mint itself, since the manager's restart is the wait; the systemd unit starts it after esp-mint. A restart is picked up from what is on disk by the rules of a crash (see "Crash ordering").
+
+**Stopping.** SIGTERM and SIGINT stop the API gracefully (no new connections, the requests being answered finish) and the process exits with status 0.
+
+**Opening the data twice.** The database allows one process at a time, so a new process that starts while the old one is still stopping cannot open it; it exits with an error and the service manager starts it again. The storage that replaces sled has to give the same refusal or an equivalent single-writer guarantee, and the issue records and the spent list have to be written atomically and be durable once the call that wrote them returns, in the order "Crash ordering" gives.
+
+**Health.** `GET /health` is `200` while the spender has no fault and `503` (`status: "broken"`, with the reason) after. The monitor in `sandbox-mint/ops` polls it and reports or restarts a mint that stays unhealthy.

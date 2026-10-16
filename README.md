@@ -72,6 +72,8 @@ cargo test
 cargo fmt --check
 ```
 
+`tests/fsp_flow.rs` runs a real esp-mint, taken at its release tag, so a change in esp-mint is not exercised until the tag moves. Before a release in which esp-mint and fsp-mint change together, run `SP_LOCAL_ONLY=fsp-mint sh ~/sandbox-mint/scripts/test-wallet-against-local-mints.sh`, which runs these tests against the esp-mint folder on this machine without changing any repo. With the tag as it is, the esp-mint test state needs the newer field `in_flight`, so these tests build only against the local folder until esp-mint is tagged again.
+
 Unit tests are in each module. `tests/fsp_flow.rs` starts a real esp-mint in the same process. The spend-path throughput test is `cargo test --release throughput -- --nocapture`.
 
 ## Documentation
@@ -79,5 +81,6 @@ Unit tests are in each module. `tests/fsp_flow.rs` starts a real esp-mint in the
 - [DESIGN.md](DESIGN.md): how fsp-mint works and why: issuing, crash ordering, spending, key rotation, fees.
 - [CHANGELOG.md](CHANGELOG.md): what was built and what changed.
 - [ROADMAP.md](../sandbox-mint/ROADMAP.md) (in `sandbox-mint`): left to do and not decided yet, for every repo.
+- [OPERATIONS.md](../sandbox-mint/OPERATIONS.md) (in `sandbox-mint`): running the mints as services: `launchd` and `systemd` definitions, install and uninstall, the health monitor.
 - [ecash-wallet](../ecash-wallet/README.md): the wallet side (`ecash-wallet fsp ...`) and the regtest runs in its `REGTEST.md` (steps 35 to 37, 42, 43 and 48).
 - [sandbox-mint README](../sandbox-mint/README.md): the family of repos.

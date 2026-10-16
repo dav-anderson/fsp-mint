@@ -216,11 +216,36 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     .map_err(|e| format!("cannot bind {bind}: {e}"))?;
                 println!("fsp-mint api listening on http://{bind}");
                 axum::serve(listener, server::router(state))
+                    .with_graceful_shutdown(async {
+                        shutdown_signal().await;
+                        println!("shutting down");
+                    })
                     .await
                     .map_err(|e| e.to_string())
             })
         }
         other => Err(format!("unknown command `{other}`. Run with --help")),
+    }
+}
+
+/// Resolves on SIGINT (Ctrl-C) or SIGTERM, which is what `launchd` and
+/// `systemd` send to stop a service. The server then stops taking new
+/// connections, lets the requests it is answering finish, and returns, and the
+/// process exits with status 0.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).ok();
+    let terminate = async {
+        match term.as_mut() {
+            Some(t) => {
+                t.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate => {}
     }
 }
 

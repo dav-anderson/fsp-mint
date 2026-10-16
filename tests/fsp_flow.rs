@@ -75,6 +75,7 @@ fn start_esp(rt: &Runtime, dir: &PathBuf) -> (String, Arc<EspState>) {
         responses: Mutex::new(responses),
         queue_path: dir.join("esp").join("queue.json"),
         queue_lock: Mutex::new(()),
+        in_flight: Default::default(),
         config: esp_mint::config::Handle::default(),
         rotor: None,
         rollovers: None,

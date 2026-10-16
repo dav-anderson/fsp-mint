@@ -1,6 +1,6 @@
 [package]
 name = "fsp-mint"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -24,11 +24,11 @@ serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 axum = "0.8"
 toml = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "signal"] }
 
 [dev-dependencies]
 # The tests start a real esp-mint in the process, as the Issuer.
-esp-mint = { git = "https://github.com/dav-anderson/esp-mint.git", tag = "v0.2.0" }
+esp-mint = { git = "https://github.com/dav-anderson/esp-mint.git", tag = "v0.3.0" }
 
 [lib]
 name = "fsp_mint"

@@ -2,6 +2,12 @@
 
 fsp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.2.1 (2026-10-16)
+
+- Tests: `tests/fsp_flow.rs` builds esp-mint's state with the new `in_flight` field, so it needs esp-mint after the lock change (the local folder, or the next tag). `sandbox-mint/scripts/test-wallet-against-local-mints.sh` now also runs fsp-mint's tests against the local esp-mint.
+
+- **Running as a service.** `serve` now stops on SIGTERM as well as SIGINT (the API drains and the process exits 0); before, it did not stop gracefully on either. `tokio` gets the `signal` feature. `launchd` and `systemd` definitions, env and monitor settings examples and `sp-health-monitor.sh` are in `sandbox-mint/ops`, with the steps in `sandbox-mint/OPERATIONS.md`. DESIGN.md: "Running as a service", with what the AIR storage has to keep.
+
 ## 0.2.0
 
 - The cache of the ESP mint's current keyset is no longer refreshed when the ESP mint answers `keyset_not_current` (it no longer sends it: it signs with any live keyset). It is still dropped and read again on `keyset_retired`.
