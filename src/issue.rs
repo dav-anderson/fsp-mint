@@ -197,7 +197,7 @@ pub struct IssueContext<'a> {
 /// The Issuer's current keyset for new transfers: the cached one while it is
 /// younger than the TTL, else read again. A failed read falls back to the
 /// cached one (it is only replaced, never expired, by the TTL; dropped only
-/// when the Issuer says it is retired or not current); with none cached the
+/// when the Issuer says it is retired); with none cached the
 /// issue is refused `502 issuer_unavailable`.
 fn esp_keyset(
     issues: &mut Issues,
@@ -446,12 +446,12 @@ pub fn issue(
             continue;
         }
         let mut outcome = issuer.transfer(&pending.groups[g].transfer);
-        // The Issuer rotated since the keyset was cached: drop it, read the
-        // current one, re-blind the group's ESP outputs for it and try once
-        // more (nothing was burned by the refusal).
+        // The cached keyset was deleted at the Issuer (it signs with any live
+        // set, so a set that has only been rotated to previous still works):
+        // drop it, read the current one, re-blind the group's ESP outputs for
+        // it and try once more (nothing was burned by the refusal).
         if let TransferOutcome::Refused { code, .. } = &outcome {
-            if code == sp_wire::codes::KEYSET_RETIRED || code == sp_wire::codes::KEYSET_NOT_CURRENT
-            {
+            if code == sp_wire::codes::KEYSET_RETIRED {
                 issues.esp_keyset = None;
                 if let Ok(fresh) = esp_keyset(issues, issuer, ctx) {
                     if fresh != pending.groups[g].transfer.keyset {

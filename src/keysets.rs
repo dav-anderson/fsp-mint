@@ -5,8 +5,10 @@
 //! unit, so a wallet can tell which keyset signed a note.
 //!
 //! **Rotation.** At genesis there is one keyset (epoch 0) and one spent list.
-//! Rotation is off until `rotation.activation_date` (UTC, `YYYY-MM-DD`). From
-//! that date the epoch is `1 + (days since activation) / rotation.period_days`.
+//! Rotation is off while `rotation.activation_hours` is 0, and until the first
+//! FSP is issued. It starts `rotation.activation_hours` after that first issue
+//! (recorded in `first_issue.json`). From then the epoch is
+//! `1 + (hours since activation) / rotation.period_hours`.
 //! Each time the epoch moves on, a new keyset is made and becomes current, the
 //! one before it becomes previous, and anything older is deleted with its spent
 //! list. So after activation there are at most two keysets: current (new notes

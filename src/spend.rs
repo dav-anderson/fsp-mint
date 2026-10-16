@@ -38,7 +38,7 @@ use secp256k1::SECP256K1;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use crate::api::{MAX_MEMO_BYTES, SpendRequest, SpendResponse};
+use crate::api::{SpendRequest, SpendResponse};
 use crate::keysets::{Keyset, Keysets, Rotation};
 
 pub fn log_name(keyset: &str) -> String {
@@ -146,6 +146,8 @@ pub struct Spender {
     broken: Arc<AtomicBool>,
     /// `spend.max_items`; the default is only a default (see `config`).
     max_items: usize,
+    /// `spend.max_memo_bytes`; likewise only a default here.
+    max_memo_bytes: usize,
 }
 
 /// Read a log, cutting off a last line that a crash left half written.
@@ -265,6 +267,7 @@ impl Spender {
             tx: Mutex::new(tx),
             broken,
             max_items: crate::config::DEFAULT_MAX_ITEMS,
+            max_memo_bytes: crate::api::MAX_MEMO_BYTES,
         })
     }
 
@@ -272,6 +275,13 @@ impl Spender {
     /// spend. Call it right after `open`.
     pub fn with_max_items(mut self, max_items: usize) -> Self {
         self.max_items = max_items.max(1);
+        self
+    }
+
+    /// Set `spend.max_memo_bytes`, the longest memo on a spend. Call it right
+    /// after `open`.
+    pub fn with_max_memo_bytes(mut self, max_memo_bytes: usize) -> Self {
+        self.max_memo_bytes = max_memo_bytes;
         self
     }
 
@@ -359,10 +369,11 @@ impl Spender {
                 format!("at most {max} notes and {max} outputs"),
             ));
         }
-        if request.memo.len() > MAX_MEMO_BYTES {
+        let max_memo = self.max_memo_bytes;
+        if request.memo.len() > max_memo {
             return Err(refuse(
                 "memo_too_long",
-                format!("the memo is at most {MAX_MEMO_BYTES} bytes"),
+                format!("the memo is at most {max_memo} bytes"),
             ));
         }
         let mut nonces = HashSet::new();

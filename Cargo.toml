@@ -1,6 +1,6 @@
 [package]
 name = "fsp-mint"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -14,7 +14,7 @@ mint-server = { git = "https://github.com/dav-anderson/mint-core.git", tag = "v0
 # The wire types, shared with the other mints and the wallet. This is the only
 # thing fsp-mint takes from the ESP side at run time: it talks to esp-mint over
 # HTTP and does not link its code.
-sp-wire = { git = "https://github.com/dav-anderson/sp-wire.git", tag = "v0.2.0" }
+sp-wire = { git = "https://github.com/dav-anderson/sp-wire.git", tag = "v0.3.0" }
 secp256k1 = { version = "0.30", default-features = false, features = ["global-context", "rand", "serde"] }
 sha2 = "0.10"
 hex = "0.4.3"
@@ -28,7 +28,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"]
 
 [dev-dependencies]
 # The tests start a real esp-mint in the process, as the Issuer.
-esp-mint = { git = "https://github.com/dav-anderson/esp-mint.git", tag = "v0.1.2" }
+esp-mint = { git = "https://github.com/dav-anderson/esp-mint.git", tag = "v0.2.0" }
 
 [lib]
 name = "fsp_mint"

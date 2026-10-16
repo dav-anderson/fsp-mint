@@ -197,7 +197,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 fsp_mint::now_secs(),
             )
             .map_err(|e| e.to_string())?
-            .with_max_items(cfg.spend_max_items as usize);
+            .with_max_items(cfg.spend_max_items as usize)
+            .with_max_memo_bytes(cfg.spend_max_memo_bytes as usize);
             let issues = Issues::open(&dir).map_err(|e| e.to_string())?;
             let bind = cfg.bind.clone();
             let state = Arc::new(FspState {

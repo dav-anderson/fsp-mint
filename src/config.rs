@@ -92,6 +92,13 @@ pub const SPECS: &[Spec] = &[
         what: "The most notes in, and the most outputs, in one spend. More is refused 400 too_many_items. The wallet reads it from GET /fees. 1 to 100000.",
     },
     Spec {
+        key: "spend.max_memo_bytes",
+        env: "FSP_SPEND_MAX_MEMO_BYTES",
+        default: "256",
+        units: "bytes",
+        what: "The longest memo on a spend. A longer one is refused 400 memo_too_long before anything is spent. The wallet reads it from GET /fees. 0 to 65536.",
+    },
+    Spec {
         key: "spend.max_batch",
         env: "FSP_SPEND_MAX_BATCH",
         default: "1024",
@@ -117,7 +124,7 @@ pub const SPECS: &[Spec] = &[
         env: "FSP_ESP_KEYSET_TTL_SECS",
         default: "3600",
         units: "seconds",
-        what: "How long the ESP mint's current keyset, which new issue transfers name for their outputs, is used before it is read again (GET /keysets). It is also read again at once when the ESP mint answers keyset_retired or keyset_not_current. If a read fails, the cached keyset is used; only with none cached is an issue refused 502 issuer_unavailable. 1 to 604800.",
+        what: "How long the ESP mint's current keyset, which new issue transfers name for their outputs, is used before it is read again (GET /keysets). It is also read again at once when the ESP mint answers keyset_retired (the cached set was deleted; a set that has only become the previous one is still signed with). If a read fails, the cached keyset is used; only with none cached is an issue refused 502 issuer_unavailable. 1 to 604800.",
     },
 ];
 
@@ -136,6 +143,7 @@ pub struct Config {
     pub spend_max_batch: u64,
     pub issue_max_items: u64,
     pub spend_max_items: u64,
+    pub spend_max_memo_bytes: u64,
 }
 
 impl Default for Config {
@@ -154,6 +162,7 @@ impl Default for Config {
             spend_max_batch: 1024,
             issue_max_items: DEFAULT_MAX_ITEMS as u64,
             spend_max_items: DEFAULT_MAX_ITEMS as u64,
+            spend_max_memo_bytes: sp_wire::fsp::MAX_MEMO_BYTES as u64,
         }
     }
 }
@@ -193,6 +202,7 @@ impl Config {
             "spend.max_batch" => self.spend_max_batch.to_string(),
             "issue.max_items" => self.issue_max_items.to_string(),
             "spend.max_items" => self.spend_max_items.to_string(),
+            "spend.max_memo_bytes" => self.spend_max_memo_bytes.to_string(),
             _ => return None,
         })
     }
@@ -212,6 +222,7 @@ impl Config {
             "spend.max_batch" => self.spend_max_batch = whole(key, value)?,
             "issue.max_items" => self.issue_max_items = whole(key, value)?,
             "spend.max_items" => self.spend_max_items = whole(key, value)?,
+            "spend.max_memo_bytes" => self.spend_max_memo_bytes = whole(key, value)?,
             _ => return Err(format!("unknown setting `{key}`")),
         }
         Ok(())
@@ -286,6 +297,12 @@ impl Config {
             p.push(format!(
                 "spend.max_items = {} must be 1 to 100000",
                 self.spend_max_items
+            ));
+        }
+        if self.spend_max_memo_bytes > 65_536 {
+            p.push(format!(
+                "spend.max_memo_bytes = {} must be 0 to 65536",
+                self.spend_max_memo_bytes
             ));
         }
         if p.is_empty() { Ok(()) } else { Err(p) }
@@ -503,6 +520,9 @@ mod tests {
         let l = load(&d, &env).unwrap();
         assert_eq!(l.config.issue_max_items, 50);
         assert_eq!(l.config.spend_max_items, 20);
+        assert_eq!(Config::default().spend_max_memo_bytes, 256);
+        let memo = |n: &str| (n == "FSP_SPEND_MAX_MEMO_BYTES").then(|| "1024".to_string());
+        assert_eq!(load(&d, &memo).unwrap().config.spend_max_memo_bytes, 1024);
         assert_eq!(l.sources["issue.max_items"], Source::File);
         assert_eq!(
             l.sources["spend.max_items"],
@@ -516,7 +536,8 @@ mod tests {
         let mut c = Config::default();
         c.set("issue.max_items", "0").unwrap();
         c.set("spend.max_items", "100001").unwrap();
-        assert_eq!(c.validate().unwrap_err().len(), 2);
+        c.set("spend.max_memo_bytes", "65537").unwrap();
+        assert_eq!(c.validate().unwrap_err().len(), 3);
         fs::remove_dir_all(&d).unwrap();
     }
 

@@ -187,6 +187,7 @@ async fn fees(State(s): State<Arc<FspState>>) -> Reply {
         max_request_bytes: s.config.max_request_bytes,
         issue_max_items: Some(s.config.issue_max_items),
         spend_max_items: Some(s.config.spend_max_items),
+        spend_max_memo_bytes: Some(s.config.spend_max_memo_bytes),
     };
     (
         StatusCode::OK,

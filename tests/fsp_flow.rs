@@ -587,6 +587,31 @@ fn the_spend_limit_is_the_setting_and_is_served_on_fees() {
         .unwrap();
     assert_eq!(fees.issue_max_items, Some(1000));
     assert_eq!(fees.spend_max_items, Some(1000));
+    assert_eq!(fees.spend_max_memo_bytes, Some(256));
+}
+
+#[test]
+fn the_memo_limit_is_the_setting_and_a_long_memo_is_refused_before_anything_is_spent() {
+    let dir = scratch("spendmemo").join("fsp");
+    std::fs::create_dir_all(&dir).unwrap();
+    let rt = Runtime::new().unwrap();
+    let off = fsp_mint::keysets::Rotation {
+        first_issue: None,
+        activation_secs: 0,
+        period_secs: 1,
+    };
+    let sp = Spender::open(&dir, off, 64, NOW)
+        .unwrap()
+        .with_max_memo_bytes(4);
+    let k = sp.keysets(NOW).unwrap().last().cloned().unwrap();
+    let (n, s) = fsp_note(&k, 2);
+    let held = vec![(n, s, 2)];
+    // the helper's memo, "order 1", is 7 bytes: over this mint's 4
+    let req = spend_request(&k.id, &held, &[Out::new(1).mint()], 1);
+    let e = rt.block_on(sp.spend(&req, NOW)).unwrap_err();
+    assert_eq!(e.code, "memo_too_long");
+    assert!(e.why.contains("at most 4 bytes"), "{}", e.why);
+    assert!(!sp.is_spent(&k.id, &held[0].0.nonce.0.serialize()));
 }
 
 #[test]
