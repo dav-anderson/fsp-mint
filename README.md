@@ -6,7 +6,7 @@ FSP is the fast point. Each AIR service runs its own copy of this mint and issue
 
 Built and tested: settings, the service's DID key, `POST /issue` (ESP in, FSP out), `POST /spend` (a swap with change), `GET /keys`, `GET /fees`, `GET /rotation`, `GET /health`, key rotation, and `export-esp` to hand the kept ESP to the service's wallet for redemption. Tests: `cargo test` (unit tests in each module and `tests/fsp_flow.rs`, which runs a real esp-mint in the same process). The wallet side (`ecash-wallet fsp ...`) is built and documented in the ecash-wallet README, and the regtest runs are in its `REGTEST.md` (steps 35 to 37, 42, 43 and 48). The family and its status are in the top-level `~/sandbox-mint/README.md`.
 
-fsp-mint builds from tagged dependencies: mint-core at `v0.1.3` and `sp-wire` at `v0.1.0` (git tags). It does not use the `air` crate. Its tests start a real esp-mint in the process, so `esp-mint` at `v0.1.1` is a dev-dependency; the mint itself does not link esp-mint and talks to it over HTTP. To test against unpushed local copies, `source ~/sandbox-mint/scripts/local-git.sh` points git at the local folders and their local tags (the recipe, with the plain `[patch]` form, is in the top-level README in `sandbox-mint`).
+fsp-mint builds from tagged dependencies: mint-core at `v0.1.3` and `sp-wire` at `v0.2.0` (git tags). It does not use the `air` crate. Its tests start a real esp-mint in the process, so `esp-mint` at `v0.1.2` is a dev-dependency; the mint itself does not link esp-mint and talks to it over HTTP. To test against unpushed local copies, `source ~/sandbox-mint/scripts/local-git.sh` points git at the local folders and their local tags (the recipe, with the plain `[patch]` form, is in the top-level README in `sandbox-mint`).
 
 ## Design
 
@@ -52,7 +52,7 @@ One issue spans two mints run by different operators, so it runs as a stored ent
 
 The request and response bodies (`IssueRequest`, `SpendRequest` and the rest of `src/api.rs`), their hashes and digests, the size helper `issue_group_size` and the error codes are defined in the `sp-wire` crate, not here. `src/api.rs` re-exports them, so `fsp_mint::api::*` is unchanged. The transfer request this mint sends to the ESP mint is the `sp-wire` type too. The wallet and the other mints build against the same crate, so they cannot drift from this mint by a byte.
 
-`GET /health` returns `wire_version`, the crate's `WIRE_VERSION` (1 to start). **Changing any encoded byte or JSON field in `sp-wire` means bumping `WIRE_VERSION`**, and a wallet refuses a mint that reports another number. Golden-bytes and size tests in `sp-wire` fail if a byte moves. The golden values were captured from this mint before the move.
+`GET /health` returns `wire_version`, the crate's `WIRE_VERSION` (2: version 1 was the first release, and version 2 changed only the sealed PSP payload, which this mint does not handle, so no FSP byte moved). **Changing any encoded byte or JSON field in `sp-wire` means bumping `WIRE_VERSION`**, and a wallet refuses a mint that reports another number. Golden-bytes and size tests in `sp-wire` fail if a byte moves. The golden values were captured from this mint before the move.
 
 ## HTTP API
 
