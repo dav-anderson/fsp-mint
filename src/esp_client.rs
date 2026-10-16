@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use esp_mint::transfer::{TransferRequest, TransferResponse};
+use sp_wire::esp::transfer::{TransferRequest, TransferResponse};
 
 /// What the Issuer said to a transfer.
 #[derive(Debug, Clone, PartialEq, Eq)]

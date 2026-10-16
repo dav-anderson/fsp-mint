@@ -6,6 +6,8 @@ FSP is the fast point. Each AIR service runs its own copy of this mint and issue
 
 Built and tested: settings, the service's DID key, `POST /issue` (ESP in, FSP out), `POST /spend` (a swap with change), `GET /keys`, `GET /fees`, `GET /rotation`, `GET /health`, key rotation, and `export-esp` to hand the kept ESP to the service's wallet for redemption. Tests: `cargo test` (unit tests in each module and `tests/fsp_flow.rs`, which runs a real esp-mint in the same process). The wallet side (`ecash-wallet fsp ...`) is built and documented in the ecash-wallet README, and the regtest runs are in its `REGTEST.md` (steps 35 to 37, 42, 43 and 48). The family and its status are in the top-level `~/sandbox-mint/README.md`.
 
+fsp-mint builds from tagged dependencies: mint-core at `v0.1.3` and `sp-wire` at `v0.1.0` (git tags). It does not use the `air` crate. Its tests start a real esp-mint in the process, so `esp-mint` at `v0.1.1` is a dev-dependency; the mint itself does not link esp-mint and talks to it over HTTP. To test against unpushed local copies, `source ~/sandbox-mint/scripts/local-git.sh` points git at the local folders and their local tags (the recipe, with the plain `[patch]` form, is in the top-level README in `sandbox-mint`).
+
 ## Design
 
 How fsp-mint is built, and why. Each item says what the design is and gives the reason.
@@ -46,6 +48,12 @@ One issue spans two mints run by different operators, so it runs as a stored ent
 
 **Throughput.** `throughput_of_the_spend_path` (run `cargo test --release throughput -- --nocapture`) sends 2000 spends (one note in, one change output) through the spend core with 8 worker threads, including proof and signature checks and the synced log. On the development Mac it measured about 62,000 spends a second (2026-10-15), well above the target of a thousand. It does not include HTTP or the network.
 
+## Wire format and versions
+
+The request and response bodies (`IssueRequest`, `SpendRequest` and the rest of `src/api.rs`), their hashes and digests, the size helper `issue_group_size` and the error codes are defined in the `sp-wire` crate, not here. `src/api.rs` re-exports them, so `fsp_mint::api::*` is unchanged. The transfer request this mint sends to the ESP mint is the `sp-wire` type too. The wallet and the other mints build against the same crate, so they cannot drift from this mint by a byte.
+
+`GET /health` returns `wire_version`, the crate's `WIRE_VERSION` (1 to start). **Changing any encoded byte or JSON field in `sp-wire` means bumping `WIRE_VERSION`**, and a wallet refuses a mint that reports another number. Golden-bytes and size tests in `sp-wire` fail if a byte moves. The golden values were captured from this mint before the move.
+
 ## HTTP API
 
 | Route | What it does |
@@ -55,7 +63,7 @@ One issue spans two mints run by different operators, so it runs as a stored ent
 | `GET /keys` | The public keys of the current and previous keysets, by ID. |
 | `GET /fees` | The fees and limits in force: `issue_fee_per_byte`, the issue size formula (`issue_group_fixed_bytes` 16, `issue_note_bytes` 106, `issue_output_bytes` 41), `max_request_bytes`, `issue_max_items` and `spend_max_items`. The wallet does not read these two yet (it reads only the ESP mint's limits); an FSP request over a limit is refused by the mint before anything is spent. |
 | `GET /rotation` | Whether rotation is on, the first-issue time and the current and previous keysets. See "`GET /rotation`". |
-| `GET /health` | `200` with `status` `ok`, or `503` with `status` `broken` and a `reason` (a failed write to the spent log). Also reports `network` and `service`. |
+| `GET /health` | `200` with `status` `ok`, or `503` with `status` `broken` and a `reason` (a failed write to the spent log). Also reports `network`, `service` and `wire_version` (an integer: the version of the wire format this mint speaks; a wallet refuses a mint whose number is not its own). |
 
 ## Key rotation
 

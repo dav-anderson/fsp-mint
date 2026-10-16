@@ -31,12 +31,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use esp_mint::transfer::{self, TransferRequest};
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
 use rand::rngs::OsRng;
 use secp256k1::schnorr::Signature;
 use secp256k1::{Keypair, SECP256K1, SecretKey, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
+use sp_wire::esp::transfer::{self, TransferRequest};
 
 use crate::api::{GroupResult, IssueRequest, IssueResponse, issue_group_size};
 use crate::esp_client::{Issuer, TransferOutcome};
@@ -173,7 +173,7 @@ fn refuse(code: &'static str, why: impl Into<String>) -> IssueError {
 fn internal(e: impl std::fmt::Display) -> IssueError {
     IssueError {
         status: 500,
-        code: "internal",
+        code: sp_wire::codes::INTERNAL,
         why: e.to_string(),
     }
 }
@@ -218,7 +218,7 @@ fn esp_keyset(
             Some((k, _)) => Ok(k.clone()),
             None => Err(IssueError {
                 status: 502,
-                code: "issuer_unavailable",
+                code: sp_wire::codes::ISSUER_UNAVAILABLE,
                 why: format!("could not read the Issuer's keyset: {why}; retry"),
             }),
         },
@@ -277,7 +277,7 @@ pub fn check(request: &IssueRequest, ctx: &IssueContext) -> Result<(), IssueErro
             }
             if n.keyset.len() != 16 || !n.keyset.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(refuse(
-                    "missing_keyset",
+                    sp_wire::codes::MISSING_KEYSET,
                     format!(
                         "group {g} note {i}: name the ESP keyset that signed the note (keyset, 16 hex)"
                     ),
@@ -310,7 +310,7 @@ pub fn check(request: &IssueRequest, ctx: &IssueContext) -> Result<(), IssueErro
             * ctx.fee_per_byte as u128;
         if fsp + fee != esp {
             return Err(refuse(
-                "not_exact",
+                sp_wire::codes::NOT_EXACT,
                 format!(
                     "group {g}: the ESP is {esp} units, the FSP outputs {fsp} and the fee {fee}; the ESP must equal the outputs plus the fee"
                 ),
@@ -405,7 +405,7 @@ pub fn issue(
                         {
                             return Err(IssueError {
                                 status: 409,
-                                code: "note_held",
+                                code: sp_wire::codes::NOTE_HELD,
                                 why: "a note or output of this request is held by another issue that has not finished: retry that one".into(),
                             });
                         }
@@ -450,7 +450,8 @@ pub fn issue(
         // current one, re-blind the group's ESP outputs for it and try once
         // more (nothing was burned by the refusal).
         if let TransferOutcome::Refused { code, .. } = &outcome {
-            if code == "keyset_retired" || code == "keyset_not_current" {
+            if code == sp_wire::codes::KEYSET_RETIRED || code == sp_wire::codes::KEYSET_NOT_CURRENT
+            {
                 issues.esp_keyset = None;
                 if let Ok(fresh) = esp_keyset(issues, issuer, ctx) {
                     if fresh != pending.groups[g].transfer.keyset {
@@ -474,7 +475,7 @@ pub fn issue(
                 {
                     return Err(IssueError {
                         status: 502,
-                        code: "issuer_unavailable",
+                        code: sp_wire::codes::ISSUER_UNAVAILABLE,
                         why: "the Issuer's transfer reply does not fit the request; retry".into(),
                     });
                 }
@@ -511,7 +512,7 @@ pub fn issue(
             TransferOutcome::Unknown(why) => {
                 return Err(IssueError {
                     status: 502,
-                    code: "issuer_unavailable",
+                    code: sp_wire::codes::ISSUER_UNAVAILABLE,
                     why: format!(
                         "the ESP transfer at the Issuer did not answer ({why}). Nothing was issued yet; send the same request again to finish it"
                     ),
@@ -554,7 +555,7 @@ pub fn issue(
                 }
             }
             GroupState::Refused { why } => GroupResult::Refused {
-                code: "issuer_refused".into(),
+                code: sp_wire::codes::ISSUER_REFUSED.into(),
                 why: why.clone(),
             },
             GroupState::Waiting => return Err(internal("a group is still waiting")),
@@ -598,7 +599,7 @@ mod tests {
                 return s.remove(0);
             }
             let k = kp(9).public_key();
-            TransferOutcome::Done(esp_mint::exchange::ExchangeResponse {
+            TransferOutcome::Done(sp_wire::esp::exchange::ExchangeResponse {
                 service: request.service,
                 redeemable_after_day: request.redeemable_after_day,
                 keyset: request.keyset.clone(),

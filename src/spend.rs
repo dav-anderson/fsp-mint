@@ -80,14 +80,14 @@ impl Core {
     fn not_live(&self, i: usize, id: &str) -> SpendError {
         if self.keysets.is_retired(id) {
             refuse(
-                "keyset_retired",
+                sp_wire::codes::KEYSET_RETIRED,
                 format!(
                     "note {i}: keyset {id} was rotated out and deleted; the note expired and cannot be spent"
                 ),
             )
         } else {
             refuse(
-                "unknown_keyset",
+                sp_wire::codes::UNKNOWN_KEYSET,
                 format!("note {i}: keyset {id} is not a keyset of this mint"),
             )
         }
@@ -344,7 +344,7 @@ impl Spender {
         if let Some(why) = self.fault() {
             return Err(SpendError {
                 status: 503,
-                code: "unavailable",
+                code: sp_wire::codes::UNAVAILABLE,
                 why: why.into(),
             });
         }
@@ -403,7 +403,7 @@ impl Spender {
         let outputs: u128 = request.outputs.iter().map(|o| o.amount.units as u128).sum();
         if inputs != outputs + request.pay as u128 {
             return Err(refuse(
-                "not_exact",
+                sp_wire::codes::NOT_EXACT,
                 format!(
                     "the notes are worth {inputs}, the payment is {} and the change {outputs}: they must add up",
                     request.pay
@@ -416,7 +416,7 @@ impl Spender {
             let mut core = self.lock()?;
             let deleted = core.rotate(now).map_err(|e| SpendError {
                 status: 500,
-                code: "internal",
+                code: sp_wire::codes::INTERNAL,
                 why: e.to_string(),
             })?;
             if let Some(a) = core.answers.get(&hash) {
@@ -425,7 +425,7 @@ impl Spender {
                 }
                 return Err(SpendError {
                     status: 409,
-                    code: "in_progress",
+                    code: sp_wire::codes::IN_PROGRESS,
                     why: "this spend is being written: send it again".into(),
                 });
             }
@@ -490,7 +490,7 @@ impl Spender {
                 }
                 return Err(SpendError {
                     status: 409,
-                    code: "in_progress",
+                    code: sp_wire::codes::IN_PROGRESS,
                     why: "this spend is being written: send it again".into(),
                 });
             }
@@ -526,7 +526,7 @@ impl Spender {
             };
             let mut line = serde_json::to_vec(&record).map_err(|e| SpendError {
                 status: 500,
-                code: "internal",
+                code: sp_wire::codes::INTERNAL,
                 why: e.to_string(),
             })?;
             line.push(b'\n');
@@ -547,7 +547,7 @@ impl Spender {
             .lock()
             .map_err(|_| SpendError {
                 status: 500,
-                code: "internal",
+                code: sp_wire::codes::INTERNAL,
                 why: "the writer lock is poisoned".into(),
             })?
             .send(Msg::Write {
@@ -560,7 +560,7 @@ impl Spender {
             self.broken.store(true, Ordering::SeqCst);
             return Err(SpendError {
                 status: 500,
-                code: "internal",
+                code: sp_wire::codes::INTERNAL,
                 why: "the spend writer has stopped".into(),
             });
         }
@@ -568,12 +568,12 @@ impl Spender {
             Ok(Ok(())) => Ok(response),
             Ok(Err(e)) => Err(SpendError {
                 status: 500,
-                code: "internal",
+                code: sp_wire::codes::INTERNAL,
                 why: e,
             }),
             Err(_) => Err(SpendError {
                 status: 500,
-                code: "internal",
+                code: sp_wire::codes::INTERNAL,
                 why: "the spend writer has stopped".into(),
             }),
         }
@@ -582,7 +582,7 @@ impl Spender {
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Core>, SpendError> {
         self.core.lock().map_err(|_| SpendError {
             status: 500,
-            code: "internal",
+            code: sp_wire::codes::INTERNAL,
             why: "the spend lock is poisoned".into(),
         })
     }

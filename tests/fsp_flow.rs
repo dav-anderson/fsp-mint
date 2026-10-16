@@ -676,6 +676,8 @@ fn a_body_over_the_ceiling_is_refused_before_parsing() {
         .json()
         .unwrap();
     assert_eq!(h["network"], "main");
+    // The wire format this mint speaks; a wallet refuses a mint on another number.
+    assert_eq!(h["wire_version"], sp_wire::WIRE_VERSION);
 }
 
 #[test]

@@ -53,7 +53,7 @@ async fn read_json<T: DeserializeOwned>(
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(json!({
                 "error": format!("{said}, and this route accepts at most {limit} bytes. Split it into several requests. Nothing was parsed or spent"),
-                "code": "request_too_large",
+                "code": sp_wire::codes::REQUEST_TOO_LARGE,
                 "size_bytes": size,
                 "limit_bytes": limit as u64,
             })),
@@ -72,7 +72,7 @@ async fn read_json<T: DeserializeOwned>(
         Err(e) => {
             return Err(error(
                 400,
-                "malformed_request",
+                sp_wire::codes::MALFORMED_REQUEST,
                 &format!("the body could not be read: {e}"),
             ));
         }
@@ -80,7 +80,7 @@ async fn read_json<T: DeserializeOwned>(
     serde_json::from_slice(&bytes).map_err(|e| {
         error(
             400,
-            "malformed_request",
+            sp_wire::codes::MALFORMED_REQUEST,
             &format!("not a valid request: {e}"),
         )
     })
@@ -91,13 +91,22 @@ async fn health(State(s): State<Arc<FspState>>) -> Reply {
     match s.spender.fault() {
         None => (
             StatusCode::OK,
-            Json(json!({"status": "ok", "network": s.config.network, "service": service})),
+            Json(json!({
+                "status": "ok",
+                "network": s.config.network,
+                "service": service,
+                "wire_version": sp_wire::WIRE_VERSION,
+            })),
         ),
         Some(why) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(
-                json!({"status": "broken", "reason": why, "network": s.config.network, "service": service}),
-            ),
+            Json(json!({
+                "status": "broken",
+                "reason": why,
+                "network": s.config.network,
+                "service": service,
+                "wire_version": sp_wire::WIRE_VERSION,
+            })),
         ),
     }
 }
@@ -127,7 +136,7 @@ async fn keys(State(s): State<Arc<FspState>>) -> Reply {
                 Json(serde_json::to_value(body).unwrap_or_default()),
             )
         }
-        Err(e) => error(500, "internal", &e),
+        Err(e) => error(500, sp_wire::codes::INTERNAL, &e),
     }
 }
 
@@ -165,7 +174,7 @@ async fn rotation(State(s): State<Arc<FspState>>) -> Reply {
             StatusCode::OK,
             Json(serde_json::to_value(body).unwrap_or_default()),
         ),
-        Err(e) => error(500, "internal", &e),
+        Err(e) => error(500, sp_wire::codes::INTERNAL, &e),
     }
 }
 
@@ -195,7 +204,7 @@ pub fn run_issue(s: &FspState, request: &IssueRequest) -> Reply {
     };
     let live = match s.spender.keysets((s.clock)()) {
         Ok(l) => l,
-        Err(e) => return error(500, "internal", &e),
+        Err(e) => return error(500, sp_wire::codes::INTERNAL, &e),
     };
     let current = Arc::clone(live.last().expect("a keyset"));
     let previous = (live.len() >= 2).then(|| Arc::clone(&live[live.len() - 2]));
@@ -210,7 +219,7 @@ pub fn run_issue(s: &FspState, request: &IssueRequest) -> Reply {
         max_items: s.config.issue_max_items as usize,
     };
     let Ok(mut issues) = s.issues.lock() else {
-        return error(500, "internal", "the issue lock is poisoned");
+        return error(500, sp_wire::codes::INTERNAL, "the issue lock is poisoned");
     };
     match issue::issue(&mut issues, s.issuer.as_ref(), request, &ctx) {
         Ok(r) => {
@@ -222,7 +231,7 @@ pub fn run_issue(s: &FspState, request: &IssueRequest) -> Reply {
                 if let Err(e) = s.spender.note_first_issue((s.clock)()) {
                     return error(
                         500,
-                        "internal",
+                        sp_wire::codes::INTERNAL,
                         &format!(
                             "could not record the first issue: {e}. Send the same request again"
                         ),
@@ -246,7 +255,11 @@ async fn issue_handler(State(s): State<Arc<FspState>>, headers: HeaderMap, body:
         };
     match tokio::task::spawn_blocking(move || run_issue(&s, &request)).await {
         Ok(r) => r,
-        Err(e) => error(500, "internal", &format!("issue task failed: {e}")),
+        Err(e) => error(
+            500,
+            sp_wire::codes::INTERNAL,
+            &format!("issue task failed: {e}"),
+        ),
     }
 }
 
