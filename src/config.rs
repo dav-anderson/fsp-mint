@@ -11,6 +11,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use sp_wire::storage::StoragePolicy;
+
 pub const FILE_NAME: &str = "fsp-mint.toml";
 pub const FILE_ENV: &str = "FSP_CONFIG";
 
@@ -126,6 +128,13 @@ pub const SPECS: &[Spec] = &[
         units: "seconds",
         what: "How long the ESP mint's current keyset, which new issue transfers name for their outputs, is used before it is read again (GET /keysets). It is also read again at once when the ESP mint answers keyset_retired (the cached set was deleted; a set that has only become the previous one is still signed with). If a read fails, the cached keyset is used; only with none cached is an issue refused 502 issuer_unavailable. 1 to 604800.",
     },
+    Spec {
+        key: "storage.mint_state",
+        env: "FSP_STORAGE_MINT_STATE",
+        default: "",
+        units: "service IDs",
+        what: "Which AIR services keep this mint's state (keys, spent lists, records), as an ordered list of service IDs: index 0 is the primary and the rest are secondaries, in the order they would be promoted. A service ID is a 32-byte x-only key in hex (64 characters); a 33-byte DID key is reduced to it. In the environment the IDs are separated by commas; in the file it is an array of strings or one such string. One entry: that service holds the state and the mint keeps a local backup copy. Empty (the default): local only. At most 8, no duplicates. Setting only for now: nothing reads or writes the AIR yet (see DESIGN.md in sandbox-mint, \"AIR storage requirements\").",
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +153,8 @@ pub struct Config {
     pub issue_max_items: u64,
     pub spend_max_items: u64,
     pub spend_max_memo_bytes: u64,
+    /// Which AIR services keep this mint's state (setting only for now).
+    pub storage_mint_state: StoragePolicy,
 }
 
 impl Default for Config {
@@ -163,6 +174,7 @@ impl Default for Config {
             issue_max_items: DEFAULT_MAX_ITEMS as u64,
             spend_max_items: DEFAULT_MAX_ITEMS as u64,
             spend_max_memo_bytes: sp_wire::fsp::MAX_MEMO_BYTES as u64,
+            storage_mint_state: StoragePolicy::default(),
         }
     }
 }
@@ -203,6 +215,7 @@ impl Config {
             "issue.max_items" => self.issue_max_items.to_string(),
             "spend.max_items" => self.spend_max_items.to_string(),
             "spend.max_memo_bytes" => self.spend_max_memo_bytes.to_string(),
+            "storage.mint_state" => self.storage_mint_state.to_config_string(),
             _ => return None,
         })
     }
@@ -223,6 +236,10 @@ impl Config {
             "issue.max_items" => self.issue_max_items = whole(key, value)?,
             "spend.max_items" => self.spend_max_items = whole(key, value)?,
             "spend.max_memo_bytes" => self.spend_max_memo_bytes = whole(key, value)?,
+            "storage.mint_state" => {
+                self.storage_mint_state =
+                    StoragePolicy::parse(value).map_err(|e| format!("{key} = `{value}`: {e}"))?
+            }
             _ => return Err(format!("unknown setting `{key}`")),
         }
         Ok(())
@@ -387,6 +404,16 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
             match value {
                 toml::Value::Integer(n) => pairs.push((key, n.to_string())),
                 toml::Value::String(s) => pairs.push((key, s.clone())),
+                toml::Value::Array(items) if key.starts_with("storage.") => {
+                    let ids: Vec<&str> = items.iter().filter_map(|v| v.as_str()).collect();
+                    if ids.len() == items.len() {
+                        pairs.push((key, ids.join(",")));
+                    } else {
+                        problems.push(format!(
+                            "{key} must be a list of strings (service IDs), not {items:?}"
+                        ));
+                    }
+                }
                 _ => problems.push(format!(
                     "{key} must be a whole number or a string, not {}",
                     value.type_str()
@@ -476,6 +503,91 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let map: BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name: &str| map.get(name).cloned()
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn the_storage_policy_comes_from_the_file_and_the_environment() {
+        const A: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        const B: &str = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+        let dir = dir("storage");
+        let first = load(&dir, &no_env).unwrap();
+        assert!(first.config.storage_mint_state.is_local_only());
+        assert_eq!(first.config.get("storage.mint_state").as_deref(), Some(""));
+
+        fs::write(
+            dir.join(FILE_NAME),
+            format!("[storage]\nmint_state = [\"{A}\", \"{B}\"]\n"),
+        )
+        .unwrap();
+        let l = load(&dir, &no_env).unwrap();
+        let p = &l.config.storage_mint_state;
+        assert_eq!(p.primary().unwrap().to_hex(), A);
+        assert_eq!(p.secondaries().len(), 1);
+        assert_eq!(l.sources["storage.mint_state"], Source::File);
+        assert_eq!(
+            l.config.get("storage.mint_state").unwrap(),
+            format!("{A},{B}")
+        );
+
+        // The environment wins over the file. One entry is valid, and a DID key
+        // is reduced to its service.
+        let did = format!("02{A}");
+        let l = load(&dir, &env_of(&[("FSP_STORAGE_MINT_STATE", did.as_str())])).unwrap();
+        assert_eq!(l.config.storage_mint_state.to_config_string(), A);
+        assert!(l.config.storage_mint_state.secondaries().is_empty());
+        assert_eq!(
+            l.sources["storage.mint_state"],
+            Source::Env("FSP_STORAGE_MINT_STATE")
+        );
+
+        // One string in the file works too, and so does an empty list.
+        fs::write(
+            dir.join(FILE_NAME),
+            format!("[storage]\nmint_state = \"{B}, {A}\"\n"),
+        )
+        .unwrap();
+        let l = load(&dir, &no_env).unwrap();
+        assert_eq!(l.config.storage_mint_state.primary().unwrap().to_hex(), B);
+        fs::write(dir.join(FILE_NAME), "[storage]\nmint_state = []\n").unwrap();
+        let l = load(&dir, &no_env).unwrap();
+        assert!(l.config.storage_mint_state.is_local_only());
+
+        // Every kind of mistake is refused, naming the variable or the setting.
+        let twice = format!("{A},{A}");
+        let p = load(&dir, &env_of(&[("FSP_STORAGE_MINT_STATE", twice.as_str())])).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("FSP_STORAGE_MINT_STATE") && x.contains("listed twice")),
+            "{p:?}"
+        );
+        let gap = format!("{A},,{B}");
+        let p = load(&dir, &env_of(&[("FSP_STORAGE_MINT_STATE", gap.as_str())])).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("entry 2")), "{p:?}");
+        let p = load(&dir, &env_of(&[("FSP_STORAGE_MINT_STATE", "not-a-key")])).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("must be hex")), "{p:?}");
+        fs::write(dir.join(FILE_NAME), "[storage]\nmint_state = [1]\n").unwrap();
+        let p = load(&dir, &no_env).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("list of strings")), "{p:?}");
+        fs::write(dir.join(FILE_NAME), "[storage]\nwallet = \"x\"\n").unwrap();
+        let p = load(&dir, &no_env).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("unknown setting `storage.wallet`")),
+            "{p:?}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

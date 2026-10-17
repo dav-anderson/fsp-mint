@@ -302,8 +302,8 @@ dependencies = [
 
 [[package]]
 name = "esp-mint"
-version = "0.3.0"
-source = "git+https://github.com/dav-anderson/esp-mint.git?tag=v0.3.0#76897cb04bddd18ab879bfc58c73539b39f45adc"
+version = "0.4.0"
+source = "git+https://github.com/dav-anderson/esp-mint.git?tag=v0.4.0#182a1794ac222ca382cca04471866f62f56ba1c4"
 dependencies = [
  "axum",
  "bdhke",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "fsp-mint"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "axum",
  "bdhke",
@@ -1412,8 +1412,8 @@ dependencies = [
 
 [[package]]
 name = "sp-wire"
-version = "0.3.0"
-source = "git+https://github.com/dav-anderson/sp-wire.git?tag=v0.3.0#6670c69e0ea42a86f0f32c1ea9e627f66b5b201e"
+version = "0.4.0"
+source = "git+https://github.com/dav-anderson/sp-wire.git?tag=v0.4.0#60ed3bca435c9613e4c94fde0eab72d2e3c6ce89"
 dependencies = [
  "hex",
  "mint-types",

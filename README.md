@@ -36,6 +36,7 @@ FSP_SERVICE_DID=<key> cargo run -- serve
 | `esp.url` | `FSP_ESP_URL` | `http://127.0.0.1:3100` | The ESP mint (Issuer) where accepted ESP is transferred. |
 | `esp.timeout_secs` | `FSP_ESP_TIMEOUT_SECS` | `30` | How long one ESP mint call may take. 1 to 600. |
 | `esp.keyset_ttl_secs` | `FSP_ESP_KEYSET_TTL_SECS` | `3600` | How long the cached ESP (Issuer) current keyset is used before it is read again; refreshed at once on `keyset_retired`. A failed read uses the cached set. 1 to 604800. |
+| `storage.mint_state` | `FSP_STORAGE_MINT_STATE` | none (local only) | Service IDs (64 hex, comma-separated) that will keep the mint's state; index 0 is the primary. One is valid; at most 8. **Setting only: nothing reads or writes the AIR yet.** See [DESIGN.md](DESIGN.md), "Storage policy". |
 
 ## Commands
 

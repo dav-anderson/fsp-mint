@@ -2,6 +2,11 @@
 
 fsp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.3.0 (2026-10-17)
+
+- **Setting `storage.mint_state` (`FSP_STORAGE_MINT_STATE`): which AIR services will keep this mint's state.** An ordered list of service IDs (index 0 the primary, the rest secondaries); one entry is valid, empty (the default) means local only, at most 8, no duplicates. Config and validation only: nothing reads or writes the AIR, the state is still local files. The parser and checks are `sp_wire::storage` (sp-wire 0.4.0), shared with the other mints and the wallet. In `fsp-mint.toml` the value is an array of strings or one string. DESIGN.md has "Storage policy (setting only)"; the planned behaviour is in sandbox-mint's DESIGN.md, "AIR storage requirements".
+- `sp-wire` is now the `v0.4.0` tag. Tests: the setting from the file and the environment, both forms, and every kind of refusal.
+
 ## 0.2.1 (2026-10-16)
 
 - Tests: `tests/fsp_flow.rs` builds esp-mint's state with the new `in_flight` field, so it needs esp-mint after the lock change (the local folder, or the next tag). `sandbox-mint/scripts/test-wallet-against-local-mints.sh` now also runs fsp-mint's tests against the local esp-mint.
