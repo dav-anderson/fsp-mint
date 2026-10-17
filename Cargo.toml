@@ -1,6 +1,6 @@
 [package]
 name = "fsp-mint"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -28,7 +28,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync",
 
 [dev-dependencies]
 # The tests start a real esp-mint in the process, as the Issuer.
-esp-mint = { git = "https://github.com/dav-anderson/esp-mint.git", tag = "v0.4.0" }
+esp-mint = { git = "https://github.com/dav-anderson/esp-mint.git", tag = "v0.5.0" }
 
 [lib]
 name = "fsp_mint"

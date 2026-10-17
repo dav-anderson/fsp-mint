@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use sp_wire::esp::transfer::{self, TransferRequest};
 
 use crate::api::{GroupResult, IssueRequest, IssueResponse, issue_group_size};
+use crate::audit::Num;
 use crate::esp_client::{Issuer, TransferOutcome};
 use crate::keysets::Keyset;
 use crate::store;
@@ -126,6 +127,14 @@ pub struct IssueData {
     /// The app's ESP notes (nonces, hex) already transferred to the service.
     #[serde(default)]
     pub transferred: std::collections::BTreeSet<String>,
+    /// FSP units issued, per key set that signed them. Counted in the same
+    /// save as the stored answer of the issue (see `audit`).
+    #[serde(default)]
+    pub issued: BTreeMap<String, Num>,
+    /// How many answered issues there were when the counters began (those
+    /// issues are not in `issued`). `None` until the first open by 0.4.0.
+    #[serde(default)]
+    pub uncounted_requests: Option<u64>,
 }
 
 pub struct Issues {
@@ -139,7 +148,8 @@ pub struct Issues {
 impl Issues {
     pub fn open(data_dir: &Path) -> io::Result<Self> {
         let path = data_dir.join(FILE_NAME);
-        let data = store::load(&path)?.unwrap_or_default();
+        let mut data: IssueData = store::load(&path)?.unwrap_or_default();
+        data.start_counting();
         Ok(Issues {
             path,
             data,
@@ -534,6 +544,7 @@ pub fn issue(
         .find(|k| k.id == pending.keyset)
         .unwrap_or(ctx.current);
     let mut groups = Vec::new();
+    let mut issued_units: i128 = 0;
     for (pg, rg) in pending.groups.iter().zip(&request.groups) {
         groups.push(match &pg.state {
             GroupState::Transferred => {
@@ -545,6 +556,7 @@ pub fn issue(
                         .ok_or_else(|| internal("not a denomination"))?;
                     signatures.push(bdhke::sign_message(sk, &o.blind_nonce.0));
                     keys.push(keyset.public[&o.amount.units]);
+                    issued_units += o.amount.units as i128;
                 }
                 GroupResult::Issued {
                     keyset: keyset.id.clone(),
@@ -565,6 +577,10 @@ pub fn issue(
         groups,
         fee_per_byte: pending.fee_per_byte,
     };
+    // The counter and the stored answer are saved together, once.
+    if issued_units > 0 {
+        issues.data.issued.entry(keyset.id.clone()).or_default().0 += issued_units;
+    }
     issues
         .data
         .entries

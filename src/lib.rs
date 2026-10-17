@@ -11,6 +11,7 @@
 //! - [`server`]: the HTTP routes.
 
 pub mod api;
+pub mod audit;
 pub mod config;
 pub mod esp_client;
 pub mod issue;

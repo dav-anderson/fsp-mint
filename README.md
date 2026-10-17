@@ -38,6 +38,8 @@ FSP_SERVICE_DID=<key> cargo run -- serve
 | `esp.keyset_ttl_secs` | `FSP_ESP_KEYSET_TTL_SECS` | `3600` | How long the cached ESP (Issuer) current keyset is used before it is read again; refreshed at once on `keyset_retired`. A failed read uses the cached set. 1 to 604800. |
 | `storage.mint_state` | `FSP_STORAGE_MINT_STATE` | none (local only) | Service IDs (64 hex, comma-separated) that will keep the mint's state; index 0 is the primary. One is valid; at most 8. **Setting only: nothing reads or writes the AIR yet.** See [DESIGN.md](DESIGN.md), "Storage policy". |
 
+**Every fee defaults to 0.** `fees.issue_fee_per_byte` is the only fee setting in fsp-mint, and with it at 0 an issue costs no more than the ESP it exchanges. A fee is charged only if the operator sets one.
+
 ## Commands
 
 | Command | What it does |
@@ -45,6 +47,7 @@ FSP_SERVICE_DID=<key> cargo run -- serve
 | `config` | Prints the settings in use and the rotation schedule. |
 | `service-key` | Makes `service_key.hex` if there is none and prints its public half for `service.did`. |
 | `serve` | Runs the HTTP API. |
+| `audit [--json]` | Prints what the mint owes and holds: outstanding FSP per key set and in all, and the ESP in reserve, matured and unmatured, each in units and in PSP. Reads the data files and writes nothing, so it works while `serve` runs. See "Audit". |
 | `export-esp --out DIR` | Writes the kept ESP, one hand-over file per redeemable-after day, for the service's ecash-wallet to `receive` and `redeem`. Stop `serve` first. |
 
 ## HTTP API
@@ -56,11 +59,24 @@ FSP_SERVICE_DID=<key> cargo run -- serve
 | `GET /keys` | The public keys of the current and previous keysets, by ID. |
 | `GET /fees` | The fees and limits in force: `issue_fee_per_byte`, the issue size formula (`issue_group_fixed_bytes` 16, `issue_note_bytes` 106, `issue_output_bytes` 41), `max_request_bytes`, `issue_max_items`, `spend_max_items` and `spend_max_memo_bytes`. The wallet does not read these yet (it reads only the ESP mint's limits); an FSP request over a limit is refused by the mint before anything is spent. |
 | `GET /rotation` | Whether rotation is on, the first-issue time and the current and previous keysets. See "`GET /rotation`". |
+| `GET /audit` | The operator audit, the same report as `fsp-mint audit --json`. Read-only. Like `/audit` on psp-mint and esp-mint it is not authenticated, so the address in `bind` decides who can read it. See "Audit". |
 | `GET /health` | `200` with `status` `ok`, or `503` with `status` `broken` and a `reason` (a failed write to the spent log). Also reports `network`, `service` and `wire_version` (an integer: the version of the wire format this mint speaks; a wallet refuses a mint whose number is not its own). |
 
 ### `GET /rotation`
 
 A public, read-only query (kept separate from `/keys` so `/keys` stays the plain key list every mint has): whether rotation is active, `first_issue`, `rotation_activation_hours`, `activation`, `rotation_period_hours`, the current and previous keysets (ID, epoch, `starts`, `current_until`, `retires`), `next_rotation`, and the mint's clock `now` (all Unix seconds). The wallet uses it for `ecash-wallet fsp-window` and to time its staggered rollover.
+
+## Audit
+
+`fsp-mint audit` and `GET /audit` give the same report. Numbers are decimal strings in the JSON (a sum of FSP can pass what a JSON reader holds exactly).
+
+**Outstanding FSP.** Per key set: `issued + change - spent`. `issued` is the FSP `POST /issue` signed for the key set, `change` the FSP `POST /spend` signed as change, `spent` the value of the notes spends used up. Over all key sets it is `issued - paid`: a swap moves value between key sets and only the amount paid leaves. `outstanding` is the total over the live key sets: what can still be spent. When a key set is deleted at rotation its notes expire; what was still outstanding in it is reported as `expired` and stays out of `outstanding`. Each figure is in FSP units and in PSP (`units / ESP_PER_PSP` from `sp-wire`, so 10^11 units to the PSP, exact to eleven decimals).
+
+**ESP in reserve.** The ESP the mint kept from issues, split into `matured` (its redeemable-after day has come: `now / 86400 >= redeemable_after_day`, the rule esp-mint uses) and `unmatured`, with the notes, the ESP and the PSP of each, a line per day, and how much of it `export-esp` has already written out (`exported_esp`; the mint cannot tell whether the service's wallet has redeemed that yet).
+
+**Warnings.** `complete` is false when issues or spends from before 0.4.0 are in the data: they did not record their amounts and cannot be counted, and the report says how many. `consistent` is false when a key set has spent more than it issued and received as change, which should never happen and is worth a look.
+
+**No dollar figure.** The USD value of FSP, PSP and ESP depends on a payout rate that this mint does not hold (and that is not kept in any of the repos). `spi audit` has the one rate and the arithmetic, and leaves FSP out of its figure.
 
 ## Wire version
 

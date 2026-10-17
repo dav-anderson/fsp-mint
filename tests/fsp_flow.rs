@@ -1,7 +1,7 @@
 //! fsp-mint end to end: a real ESP mint (the Issuer) in-process, fsp-mint in
 //! front of it, and the app side built the way the wallet builds it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -12,8 +12,9 @@ use esp_mint::responses::Responses;
 use esp_mint::server::EspState;
 use esp_mint::terms::Terms;
 use fsp_mint::api::*;
+use fsp_mint::audit::{self, Report};
 use fsp_mint::esp_client::HttpIssuer;
-use fsp_mint::issue::Issues;
+use fsp_mint::issue::{Entry, IssueData, Issues};
 use fsp_mint::keysets::Keyset;
 use fsp_mint::server::{self, FspState};
 use fsp_mint::spend::Spender;
@@ -65,7 +66,7 @@ fn serve(rt: &Runtime, app: Router) -> String {
     format!("http://{a}")
 }
 
-fn start_esp(rt: &Runtime, dir: &PathBuf) -> (String, Arc<EspState>) {
+fn start_esp(rt: &Runtime, dir: &Path) -> (String, Arc<EspState>) {
     let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
     let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
     let state = Arc::new(EspState {
@@ -203,7 +204,7 @@ struct Fsp {
     clock: Arc<AtomicU64>,
 }
 
-fn start_fsp(rt: &Runtime, dir: &PathBuf, esp_url: &str, activation: &str) -> Fsp {
+fn start_fsp(rt: &Runtime, dir: &Path, esp_url: &str, activation: &str) -> Fsp {
     let mut cfg = fsp_mint::config::Config::default();
     cfg.set("service.did", &service().to_string()).unwrap();
     cfg.set("rotation.activation_hours", activation).unwrap();
@@ -267,8 +268,8 @@ fn issue_mixed_days_keeps_the_esp_and_never_issues_twice() {
         esp_note(&esp, 1, service(), day1),
     ];
     let b = vec![esp_note(&esp, 8, service(), day2)];
-    let outs_a = vec![Out::new(4), Out::new(1)];
-    let outs_b = vec![Out::new(8)];
+    let outs_a = [Out::new(4), Out::new(1)];
+    let outs_b = [Out::new(8)];
     let req = IssueRequest {
         service: service(),
         groups: vec![
@@ -822,4 +823,375 @@ fn outputs_prepared_before_a_rotation_are_signed_by_the_new_set_and_the_reply_sa
     assert_ne!(current(&f).id, now_set.id);
     let (st, again) = post(&format!("{}/issue", f.url), &req);
     assert_eq!((st, &again), (200, &body));
+}
+
+// ---- the operator audit ----
+
+/// Issue `units` of FSP for one ESP note of `day`; the FSP note and its key.
+fn issue_one(esp: &EspState, f: &Fsp, units: u64, day: u64) -> (Note, SecretKey, String) {
+    let out = Out::new(units);
+    let req = IssueRequest {
+        service: service(),
+        groups: vec![IssueGroup {
+            redeemable_after_day: day,
+            notes: vec![esp_note(esp, units, service(), day)],
+            outputs: vec![out.mint()],
+        }],
+    };
+    let (s, body) = post(&format!("{}/issue", f.url), &req);
+    assert_eq!(s, 200, "{body}");
+    let reply: IssueResponse = serde_json::from_value(body).unwrap();
+    let GroupResult::Issued {
+        keyset,
+        signatures,
+        keys,
+        ..
+    } = &reply.groups[0]
+    else {
+        panic!("not issued")
+    };
+    let (n, sk) = out.note(&signatures[0], &keys[0]);
+    (n, sk, keyset.clone())
+}
+
+fn get_audit(f: &Fsp) -> Report {
+    reqwest::blocking::get(format!("{}/audit", f.url))
+        .unwrap()
+        .json()
+        .unwrap()
+}
+
+fn line<'a>(r: &'a Report, keyset: &str) -> &'a audit::KeysetLine {
+    r.fsp
+        .keysets
+        .iter()
+        .find(|k| k.keyset == keyset)
+        .unwrap_or_else(|| panic!("no line for {keyset}"))
+}
+
+fn units(a: &audit::Amount) -> i128 {
+    a.units.0
+}
+
+#[test]
+fn the_audit_counts_issue_spend_and_change_and_the_esp_reserve() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("audit-basic");
+    let (esp_url, esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_url, "0");
+    let today = NOW / 86_400;
+    let empty = get_audit(&f);
+    assert_eq!(units(&empty.fsp.outstanding), 0);
+    assert_eq!(empty.esp_reserve.total.notes, 0);
+    assert!(empty.complete && empty.consistent, "{:?}", empty.warnings);
+
+    // 4 + 1 FSP for ESP that is mature today, 8 FSP for ESP that is not.
+    let day_m = today;
+    let day_u = today + 30;
+    let outs = [Out::new(4), Out::new(1), Out::new(8)];
+    let req = IssueRequest {
+        service: service(),
+        groups: vec![
+            IssueGroup {
+                redeemable_after_day: day_m,
+                notes: vec![
+                    esp_note(&esp, 4, service(), day_m),
+                    esp_note(&esp, 1, service(), day_m),
+                ],
+                outputs: vec![outs[0].mint(), outs[1].mint()],
+            },
+            IssueGroup {
+                redeemable_after_day: day_u,
+                notes: vec![esp_note(&esp, 8, service(), day_u)],
+                outputs: vec![outs[2].mint()],
+            },
+        ],
+    };
+    let (s, body) = post(&format!("{}/issue", f.url), &req);
+    assert_eq!(s, 200, "{body}");
+    let (s, again) = post(&format!("{}/issue", f.url), &req);
+    assert_eq!((s, &again), (200, &body), "a retry is the stored answer");
+    let reply: IssueResponse = serde_json::from_value(body).unwrap();
+
+    let r = get_audit(&f);
+    let ks = current(&f).id.clone();
+    assert_eq!(units(&r.fsp.outstanding), 13, "counted once, not twice");
+    assert_eq!(units(&line(&r, &ks).issued), 13);
+    assert_eq!(r.fsp.outstanding.psp, "0.00000000013");
+    assert_eq!(
+        (
+            r.esp_reserve.matured.notes,
+            units(&r.esp_reserve.matured.esp)
+        ),
+        (2, 5)
+    );
+    assert_eq!(
+        (
+            r.esp_reserve.unmatured.notes,
+            units(&r.esp_reserve.unmatured.esp)
+        ),
+        (1, 8)
+    );
+    assert_eq!(r.esp_reserve.unmatured.esp.psp, "0.00000000008");
+    assert_eq!(units(&r.esp_reserve.total.esp), 13);
+    assert_eq!(r.esp_reserve.by_day.len(), 2);
+    assert!(r.complete && r.consistent, "{:?}", r.warnings);
+
+    // Pay 9 of the 13, 4 back as change.
+    let mut notes = Vec::new();
+    for (g, group_outs) in [(0usize, vec![0usize, 1]), (1, vec![2])] {
+        let GroupResult::Issued {
+            signatures, keys, ..
+        } = &reply.groups[g]
+        else {
+            unreachable!()
+        };
+        for (i, o) in group_outs.into_iter().enumerate() {
+            let (n, sk) = outs[o].note(&signatures[i], &keys[i]);
+            notes.push((n, sk, outs[o].amount));
+        }
+    }
+    let spend = spend_request(&ks, &notes, &[Out::new(4).mint()], 9);
+    assert_eq!(post(&format!("{}/spend", f.url), &spend).0, 200);
+    let r = get_audit(&f);
+    let l = line(&r, &ks);
+    assert_eq!(
+        (
+            units(&l.issued),
+            units(&l.change),
+            units(&l.spent),
+            units(&l.outstanding)
+        ),
+        (13, 4, 13, 4)
+    );
+    assert_eq!((units(&r.fsp.outstanding), units(&r.fsp.paid)), (4, 9));
+
+    // The same spend again, and the same notes in another spend: no change.
+    assert_eq!(post(&format!("{}/spend", f.url), &spend).0, 200);
+    let other = spend_request(&ks, &notes, &[Out::new(4).mint()], 9);
+    assert_eq!(post(&format!("{}/spend", f.url), &other).0, 400);
+    assert_eq!(get_audit(&f).fsp, r.fsp);
+
+    // The ESP does not change with spends: it is the reserve for them.
+    assert_eq!(units(&get_audit(&f).esp_reserve.total.esp), 13);
+    // The clock moving past day_u moves the 8 from unmatured to matured.
+    f.clock
+        .store((day_u + 1) * 86_400, std::sync::atomic::Ordering::SeqCst);
+    let later = get_audit(&f);
+    assert_eq!(units(&later.esp_reserve.unmatured.esp), 0);
+    assert_eq!(units(&later.esp_reserve.matured.esp), 13);
+}
+
+#[test]
+fn the_audit_follows_rotation_expiry_and_a_restart() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("audit-rotate");
+    let (esp_url, esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_url, "120");
+    let day = NOW / 86_400 + 365;
+    let g = current(&f).id.clone();
+    let (a, a_key, ks_a) = issue_one(&esp, &f, 16, day);
+    let (_b, _b_key, ks_b) = issue_one(&esp, &f, 8, day);
+    assert_eq!((ks_a.as_str(), ks_b.as_str()), (g.as_str(), g.as_str()));
+    let r = get_audit(&f);
+    assert_eq!(
+        (units(&r.fsp.outstanding), units(&line(&r, &g).issued)),
+        (24, 24)
+    );
+
+    // One period on: the first set is the previous one. The 16 is swapped
+    // into the new set, no payment: the total does not move, the sets do.
+    f.clock
+        .store(NOW + 5 * 86_400, std::sync::atomic::Ordering::SeqCst);
+    let out16 = Out::new(16);
+    let (st, body) = post(
+        &format!("{}/spend", f.url),
+        &spend_request(&g, &[(a, a_key, 16)], &[out16.mint()], 0),
+    );
+    assert_eq!(st, 200, "{body}");
+    let first: SpendResponse = serde_json::from_value(body).unwrap();
+    let c = first.keyset.clone();
+    assert_ne!(c, g);
+    let r = get_audit(&f);
+    assert_eq!(
+        r.fsp
+            .keysets
+            .iter()
+            .map(|k| (k.keyset.as_str(), k.status.as_str()))
+            .collect::<Vec<_>>(),
+        [(g.as_str(), "live"), (c.as_str(), "live")]
+    );
+    assert_eq!(units(&line(&r, &g).outstanding), 8);
+    assert_eq!(units(&line(&r, &c).outstanding), 16);
+    assert_eq!(
+        (units(&r.fsp.outstanding), units(&r.fsp.paid)),
+        (24, 0),
+        "a swap moves value between sets and pays nothing"
+    );
+
+    // Pay 6 out of the swapped 16, 10 as change.
+    let (n16, k16) = out16.note(&first.signatures[0], &first.keys[0]);
+    let (st, _) = post(
+        &format!("{}/spend", f.url),
+        &spend_request(
+            &c,
+            &[(n16, k16, 16)],
+            &[Out::new(8).mint(), Out::new(2).mint()],
+            6,
+        ),
+    );
+    assert_eq!(st, 200);
+    let r = get_audit(&f);
+    assert_eq!(units(&line(&r, &c).outstanding), 10);
+    assert_eq!((units(&r.fsp.outstanding), units(&r.fsp.paid)), (18, 6));
+
+    // Another period: the first set is deleted with the 8 nobody spent.
+    f.clock
+        .store(NOW + 15 * 86_400, std::sync::atomic::Ordering::SeqCst);
+    let after = get_audit(&f);
+    let gone = line(&after, &g);
+    assert_eq!(gone.status, "retired");
+    assert_eq!(units(&gone.outstanding), 8);
+    assert_eq!(units(&after.fsp.expired), 8, "expired, not outstanding");
+    assert_eq!(units(&after.fsp.outstanding), 10);
+    assert_eq!(units(&after.fsp.paid), 6);
+    assert!(after.complete && after.consistent, "{:?}", after.warnings);
+    assert!(dir.join("fsp").join(audit::LEDGER_FILE).exists());
+    assert!(!dir.join("fsp").join(fsp_mint::spend::log_name(&g)).exists());
+
+    // The files alone give the same report (what `fsp-mint audit` reads) ...
+    let now = NOW + 15 * 86_400;
+    assert_eq!(audit::from_dir(&dir.join("fsp"), now).unwrap(), {
+        let mut r = after.clone();
+        r.now = now;
+        r
+    });
+    // ... and so does a mint started again on them.
+    let off = f.state.spender.rotation();
+    let again = Spender::open(&dir.join("fsp"), off, 64, now).unwrap();
+    let view = again.audit_view(now).unwrap();
+    let issues = Issues::open(&dir.join("fsp")).unwrap();
+    assert_eq!(audit::build(now, &view, &issues.data).fsp, after.fsp);
+}
+
+#[test]
+fn a_key_set_deleted_before_its_counters_were_saved_is_folded_at_the_next_start() {
+    let dir = scratch("audit-orphan").join("fsp");
+    std::fs::create_dir_all(&dir).unwrap();
+    let rt = Runtime::new().unwrap();
+    let off = fsp_mint::keysets::Rotation {
+        first_issue: None,
+        activation_secs: 0,
+        period_secs: 1,
+    };
+    let sp = Spender::open(&dir, off, 64, NOW).unwrap();
+    let k = sp.keysets(NOW).unwrap().last().cloned().unwrap();
+    let (n, s) = fsp_note(&k, 16);
+    let req = spend_request(
+        &k.id,
+        &[(n, s, 16)],
+        &[Out::new(8).mint(), Out::new(2).mint()],
+        6,
+    );
+    rt.block_on(sp.spend(&req, NOW)).unwrap();
+    drop(sp);
+
+    // A reader next to a mint sees a half-written last line and leaves it.
+    use std::io::Write;
+    let log = dir.join(fsp_mint::spend::log_name(&k.id));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .unwrap()
+        .write_all(b"{\"h\":\"ab")
+        .unwrap();
+    let len = std::fs::metadata(&log).unwrap().len();
+    let counted = fsp_mint::spend::replay_counters(&dir).unwrap();
+    assert_eq!(counted[&k.id].spent.0, 16);
+    assert_eq!(counted[&k.id].change.0, 10);
+    assert_eq!(std::fs::metadata(&log).unwrap().len(), len, "read only");
+
+    // The crash: the key file moved on (the set is gone), the counters were
+    // never copied. The log is still there.
+    fsp_mint::keysets::Keysets::open(&dir)
+        .unwrap()
+        .rotate_to(2)
+        .unwrap();
+    assert!(log.exists());
+    let sp = Spender::open(&dir, off, 64, NOW).unwrap();
+    assert!(!log.exists(), "the log of a deleted set is removed");
+    let view = sp.audit_view(NOW).unwrap();
+    let c = view.retired[&k.id];
+    assert_eq!((c.spent.0, c.change.0), (16, 10));
+    assert!(view.counters.is_empty());
+    // This test's note was never issued, so the books do not balance, and
+    // the audit says so.
+    let r = audit::build(NOW, &view, &IssueData::default());
+    assert!(!r.consistent && !r.warnings.is_empty());
+    assert_eq!(units(&r.fsp.paid), 6);
+    // Started again, the ledger is read and nothing is counted twice.
+    drop(sp);
+    let sp = Spender::open(&dir, off, 64, NOW).unwrap();
+    assert_eq!(sp.audit_view(NOW).unwrap().retired[&k.id], c);
+}
+
+#[test]
+fn what_was_answered_before_the_counters_is_reported_as_not_counted() {
+    // An issue answered by 0.3.0: a stored answer, no counter.
+    let mut d = IssueData::default();
+    d.entries.insert(
+        "h".into(),
+        Entry::Done(IssueResponse {
+            groups: vec![],
+            fee_per_byte: 0,
+        }),
+    );
+    d.start_counting();
+    d.start_counting();
+    assert_eq!(d.uncounted_requests, Some(1), "set once");
+    let r = audit::build(NOW, &audit::SpendView::default(), &d);
+    assert!(!r.complete);
+    assert!(
+        r.warnings[0].contains("1 issue request"),
+        "{:?}",
+        r.warnings
+    );
+
+    // A spend line without amounts.
+    let dir = scratch("audit-legacy").join("fsp");
+    std::fs::create_dir_all(&dir).unwrap();
+    let rt = Runtime::new().unwrap();
+    let off = fsp_mint::keysets::Rotation {
+        first_issue: None,
+        activation_secs: 0,
+        period_secs: 1,
+    };
+    let sp = Spender::open(&dir, off, 64, NOW).unwrap();
+    let k = sp.keysets(NOW).unwrap().last().cloned().unwrap();
+    let (n, s) = fsp_note(&k, 2);
+    rt.block_on(sp.spend(
+        &spend_request(&k.id, &[(n, s, 2)], &[Out::new(1).mint()], 1),
+        NOW,
+    ))
+    .unwrap();
+    drop(sp);
+    let log = dir.join(fsp_mint::spend::log_name(&k.id));
+    let mut v: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&log).unwrap().trim()).unwrap();
+    assert!(v.as_object_mut().unwrap().remove("a").is_some());
+    std::fs::write(&log, format!("{v}\n")).unwrap();
+    let counted = fsp_mint::spend::replay_counters(&dir).unwrap();
+    assert_eq!(counted[&k.id].uncounted_spends, 1);
+    assert_eq!(counted[&k.id].spent.0, 0);
+    let view = audit::SpendView {
+        live: vec![k.id.clone()],
+        counters: counted,
+        retired: Default::default(),
+    };
+    let r = audit::build(NOW, &view, &IssueData::default());
+    assert!(
+        !r.complete && r.warnings[0].contains("1 spend"),
+        "{:?}",
+        r.warnings
+    );
 }

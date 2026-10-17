@@ -2,6 +2,15 @@
 
 fsp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.4.0 (2026-10-17)
+
+- Test helpers take `&Path` instead of `&PathBuf` (lint). Documentation: the storage requirements are the numbered set (1 to 8), and the service files and health monitor are described by the SPI repository, not by a folder outside this repo. Every fee setting defaults to 0 (`fees.issue_fee_per_byte` is the only one), stated in the README.
+- **Operator audit.** `GET /audit` and `fsp-mint audit [--json]`: outstanding FSP per key set and in total (`issued + change - spent`, in FSP units and PSP), FSP expired with deleted key sets, and the ESP in reserve from the kept list, matured and unmatured, in ESP and PSP, with a line per redeemable-after day and the part already written out by `export-esp`. `complete` and `consistent` flags and warnings.
+- **Crash-safe counters.** `issues.json` gets `issued` (FSP units per key set, saved with the stored answer) and `uncounted_requests`; each spend log line gets `a` (input and output units); `ledger.json` (new) keeps the counters of deleted key sets, copied before their logs go and repaired at start-up from logs left behind. Old data still loads: lines and answers from 0.3.0 are reported as not counted.
+- The spend log reader has a read-only mode that ignores a half-written last line instead of cutting it (used by `audit`; `serve` still cuts it at start-up).
+- New module `audit`. Tests in `tests/fsp_flow.rs`: counts across issue (once, with a retry), spend, change and a refused spend; the reserve across the maturity day; rotation, expiry, the report from the files equal to the report from the mint, and a restart; a key set deleted before its counters were saved; a torn last line read without cutting; data from 0.3.0.
+- No dollar figure: the payout rate is not kept in this repo. `spi audit` does that arithmetic and leaves FSP out.
+
 ## 0.3.0 (2026-10-17)
 
 - **Setting `storage.mint_state` (`FSP_STORAGE_MINT_STATE`): which AIR services will keep this mint's state.** An ordered list of service IDs (index 0 the primary, the rest secondaries); one entry is valid, empty (the default) means local only, at most 8, no duplicates. Config and validation only: nothing reads or writes the AIR, the state is still local files. The parser and checks are `sp_wire::storage` (sp-wire 0.4.0), shared with the other mints and the wallet. In `fsp-mint.toml` the value is an array of strings or one string. DESIGN.md has "Storage policy (setting only)"; the planned behaviour is in sandbox-mint's DESIGN.md, "AIR storage requirements".

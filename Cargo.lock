@@ -302,8 +302,8 @@ dependencies = [
 
 [[package]]
 name = "esp-mint"
-version = "0.4.0"
-source = "git+https://github.com/dav-anderson/esp-mint.git?tag=v0.4.0#182a1794ac222ca382cca04471866f62f56ba1c4"
+version = "0.5.0"
+source = "git+https://github.com/dav-anderson/esp-mint.git?tag=v0.5.0#1e0a6182d5b3ff0448bff720b74f7f4a95b301a2"
 dependencies = [
  "axum",
  "bdhke",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "fsp-mint"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "bdhke",

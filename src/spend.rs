@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::api::{SpendRequest, SpendResponse};
+use crate::audit::{Counters, Ledger, SpendView};
 use crate::keysets::{Keyset, Keysets, Rotation};
 
 pub fn log_name(keyset: &str) -> String {
@@ -50,6 +51,33 @@ struct Record {
     h: String,
     n: Vec<(String, String)>,
     r: SpendResponse,
+    /// The amounts, for the audit. Absent in lines written before 0.4.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    a: Option<Amounts>,
+}
+
+/// The units of a spend: of each note in `n` (same order) and of each output.
+#[derive(Serialize, Deserialize)]
+struct Amounts {
+    i: Vec<u64>,
+    o: Vec<u64>,
+}
+
+/// Add one logged spend to the counters: its notes as spent, under the key
+/// set of each; its change under the key set that signed it (`r.keyset`).
+fn apply(stats: &mut HashMap<String, Counters>, record: &Record) {
+    let Some(a) = &record.a else {
+        stats
+            .entry(record.r.keyset.clone())
+            .or_default()
+            .uncounted_spends += 1;
+        return;
+    };
+    for ((keyset, _), units) in record.n.iter().zip(&a.i) {
+        stats.entry(keyset.clone()).or_default().spent.0 += *units as i128;
+    }
+    stats.entry(record.r.keyset.clone()).or_default().change.0 +=
+        a.o.iter().map(|u| *u as i128).sum::<i128>();
 }
 
 struct Answer {
@@ -59,11 +87,16 @@ struct Answer {
 }
 
 pub struct Core {
+    dir: PathBuf,
     keysets: Keysets,
     live: Vec<Arc<Keyset>>,
     spent: HashMap<String, HashSet<[u8; 33]>>,
     answers: HashMap<String, Answer>,
     rotation: Rotation,
+    /// The audit counters of the live key sets.
+    stats: HashMap<String, Counters>,
+    /// The counters of deleted key sets.
+    ledger: Ledger,
 }
 
 impl Core {
@@ -100,6 +133,20 @@ impl Core {
     /// Rotate if the epoch moved on. Returns the deleted keyset ids.
     fn rotate(&mut self, now: u64) -> io::Result<Vec<String>> {
         let deleted = self.keysets.rotate_to(self.rotation.epoch_at(now))?;
+        // The counters of a deleted key set go to the ledger before its log
+        // is deleted (the caller sends the deletes only if this returns Ok; a
+        // failed save leaves the logs for the next start to fold).
+        let mut folded = Ok(());
+        let mut changed = false;
+        for d in &deleted {
+            if let Some(c) = self.stats.remove(d) {
+                self.ledger.retired.entry(d.clone()).or_insert(c);
+                changed = true;
+            }
+        }
+        if changed {
+            folded = self.ledger.save(&self.dir);
+        }
         if !deleted.is_empty()
             || self.live.len() != self.keysets.all().len()
             || self.live.last().map(|k| k.id.as_str()) != Some(self.keysets.current().id.as_str())
@@ -110,6 +157,7 @@ impl Core {
             }
             self.refresh();
         }
+        folded?;
         Ok(deleted)
     }
 }
@@ -150,8 +198,10 @@ pub struct Spender {
     max_memo_bytes: usize,
 }
 
-/// Read a log, cutting off a last line that a crash left half written.
-fn read_log(path: &Path) -> io::Result<Vec<Record>> {
+/// Read a log. A last line that a crash left half written is cut off when
+/// `repair` is set (the mint at start-up), and only ignored otherwise (a reader
+/// next to a running mint, which may be in the middle of writing it).
+fn read_log(path: &Path, repair: bool) -> io::Result<Vec<Record>> {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -169,10 +219,12 @@ fn read_log(path: &Path) -> io::Result<Vec<Record>> {
         }
         if line.last() != Some(&b'\n') {
             // The last line, never finished: its spend was never answered.
-            OpenOptions::new()
-                .write(true)
-                .open(path)?
-                .set_len(good_len)?;
+            if repair {
+                OpenOptions::new()
+                    .write(true)
+                    .open(path)?
+                    .set_len(good_len)?;
+            }
             break;
         }
         let record: Record = serde_json::from_slice(&line[..line.len() - 1]).map_err(|e| {
@@ -185,6 +237,31 @@ fn read_log(path: &Path) -> io::Result<Vec<Record>> {
         good_len += n as u64;
     }
     Ok(records)
+}
+
+/// The audit counters of every log in a directory, by key set, without
+/// changing anything (a half-written last line is ignored). For the audit
+/// command; the mint itself builds the same counters in `Spender::open`.
+pub fn replay_counters(dir: &Path) -> io::Result<HashMap<String, Counters>> {
+    let mut stats = HashMap::new();
+    let mut names = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(stats),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        names.push(entry?.file_name().to_string_lossy().to_string());
+    }
+    names.sort();
+    for name in names {
+        if name.starts_with("spends-") && name.ends_with(".jsonl") {
+            for record in read_log(&dir.join(&name), false)? {
+                apply(&mut stats, &record);
+            }
+        }
+    }
+    Ok(stats)
 }
 
 fn parse_nonce(hex_text: &str) -> Option<[u8; 33]> {
@@ -204,27 +281,32 @@ impl Spender {
         let mut rotation = rotation;
         rotation.first_issue = crate::keysets::load_first_issue(data_dir)?;
         let mut keysets = Keysets::open(data_dir)?;
-        let deleted = keysets.rotate_to(rotation.epoch_at(now))?;
+        keysets.rotate_to(rotation.epoch_at(now))?;
         let live_ids: HashSet<String> = keysets.all().iter().map(|k| k.id.clone()).collect();
-        for d in deleted {
-            let _ = fs::remove_file(data_dir.join(log_name(&d)));
-        }
-        // Logs of keysets that are gone (a crash during a rotation) go too.
+        // Every log on disk is read: the live ones for the spent lists and the
+        // stored answers, and all of them for the audit counters. A key set
+        // that is gone (deleted just now, or in a crash during a rotation) has
+        // its counters copied to the ledger before its log is removed.
+        let mut ids = Vec::new();
         for entry in fs::read_dir(data_dir)? {
             let name = entry?.file_name().to_string_lossy().to_string();
             if let Some(id) = name
                 .strip_prefix("spends-")
                 .and_then(|n| n.strip_suffix(".jsonl"))
             {
-                if !live_ids.contains(id) {
-                    fs::remove_file(data_dir.join(&name))?;
-                }
+                ids.push(id.to_string());
             }
         }
+        ids.sort();
         let mut spent: HashMap<String, HashSet<[u8; 33]>> = HashMap::new();
         let mut answers = HashMap::new();
-        for k in keysets.all() {
-            for record in read_log(&data_dir.join(log_name(&k.id)))? {
+        let mut stats: HashMap<String, Counters> = HashMap::new();
+        for id in &ids {
+            for record in read_log(&data_dir.join(log_name(id)), true)? {
+                apply(&mut stats, &record);
+                if !live_ids.contains(id) {
+                    continue;
+                }
                 for (ks, n) in &record.n {
                     if live_ids.contains(ks) {
                         if let Some(n) = parse_nonce(n) {
@@ -237,17 +319,35 @@ impl Spender {
                     Answer {
                         response: record.r,
                         durable: true,
-                        file: k.id.clone(),
+                        file: id.clone(),
                     },
                 );
             }
         }
+        let mut ledger = Ledger::load(data_dir)?;
+        let mut folded = false;
+        for (id, c) in &stats {
+            if !live_ids.contains(id) && !ledger.retired.contains_key(id) {
+                ledger.retired.insert(id.clone(), *c);
+                folded = true;
+            }
+        }
+        if folded {
+            ledger.save(data_dir)?;
+        }
+        for id in ids.iter().filter(|id| !live_ids.contains(*id)) {
+            fs::remove_file(data_dir.join(log_name(id)))?;
+        }
+        stats.retain(|id, _| live_ids.contains(id));
         let mut core = Core {
+            dir: data_dir.to_path_buf(),
             keysets,
             live: Vec::new(),
             spent,
             answers,
             rotation,
+            stats,
+            ledger,
         };
         core.refresh();
         let core = Arc::new(Mutex::new(core));
@@ -327,6 +427,21 @@ impl Spender {
             first_issue: None,
             activation_secs: 0,
             period_secs: 1,
+        })
+    }
+
+    /// The spend side of the audit, after a rotation that is due.
+    pub fn audit_view(&self, now: u64) -> Result<SpendView, String> {
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| "the spend lock is poisoned".to_string())?;
+        let deleted = core.rotate(now).map_err(|e| e.to_string())?;
+        self.send_deletes(deleted);
+        Ok(SpendView {
+            live: core.live.iter().map(|k| k.id.clone()).collect(),
+            counters: core.stats.clone(),
+            retired: core.ledger.retired.clone(),
         })
     }
 
@@ -534,7 +649,16 @@ impl Spender {
                     .map(|(k, n)| (k.clone(), hex::encode(n)))
                     .collect(),
                 r: response.clone(),
+                a: Some(Amounts {
+                    i: request
+                        .inputs
+                        .iter()
+                        .map(|i| i.input.amount.units)
+                        .collect(),
+                    o: request.outputs.iter().map(|o| o.amount.units).collect(),
+                }),
             };
+            apply(&mut core.stats, &record);
             let mut line = serde_json::to_vec(&record).map_err(|e| SpendError {
                 status: 500,
                 code: sp_wire::codes::INTERNAL,

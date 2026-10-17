@@ -1,4 +1,5 @@
-//! fsp-mint command line: `config`, `service-key`, `serve`, `export-esp`.
+//! fsp-mint command line: `config`, `service-key`, `serve`, `export-esp`,
+//! `audit`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,11 @@ fsp-mint <command>
   service-key          Make the service's DID key (service_key.hex) if there is
                        none, and print its public half for service.did.
   serve                Run the HTTP API (POST /issue, POST /spend, GET /keys,
-                       GET /fees, GET /rotation, GET /health).
+                       GET /fees, GET /rotation, GET /audit, GET /health).
+  audit [--json]       Print what the mint owes and holds: outstanding FSP per
+                       key set and in total (in FSP units and PSP), and the ESP
+                       in reserve, matured and unmatured. Reads the data files,
+                       writes nothing, and works while serve runs.
   export-esp --out DIR Write the ESP this mint has kept to DIR, one hand-over
                        file per redeemable-after day, for the service's
                        ecash-wallet to `receive` and `redeem`. Stop serve first.
@@ -141,6 +146,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
             );
             Ok(())
         }
+        "audit" => {
+            let report = fsp_mint::audit::from_dir(&dir, fsp_mint::now_secs())
+                .map_err(|e| format!("cannot read the data in {}: {e}", dir.display()))?;
+            if args.iter().any(|a| a == "--json") {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                );
+            } else {
+                print_audit(&report);
+            }
+            Ok(())
+        }
         "export-esp" => {
             let out = match args.iter().position(|a| a == "--out") {
                 Some(i) if i + 1 < args.len() => PathBuf::from(&args[i + 1]),
@@ -225,6 +243,67 @@ fn run(args: Vec<String>) -> Result<(), String> {
             })
         }
         other => Err(format!("unknown command `{other}`. Run with --help")),
+    }
+}
+
+fn print_audit(r: &fsp_mint::audit::Report) {
+    use fsp_mint::audit::Amount;
+    let show = |a: &Amount| format!("{} units = {} PSP", a.units, a.psp);
+    println!();
+    println!("audit as of {} (day {})", r.now, r.today);
+    println!();
+    println!("FSP, per key set (outstanding = issued + change - spent):");
+    for k in &r.fsp.keysets {
+        println!("  {} ({})", k.keyset, k.status);
+        println!("    issued      {}", show(&k.issued));
+        println!("    change      {}", show(&k.change));
+        println!("    spent       {}", show(&k.spent));
+        println!("    outstanding {}", show(&k.outstanding));
+    }
+    println!(
+        "FSP outstanding, live key sets: {}",
+        show(&r.fsp.outstanding)
+    );
+    println!(
+        "FSP expired (key sets deleted at rotation): {}",
+        show(&r.fsp.expired)
+    );
+    println!("FSP issued in all: {}", show(&r.fsp.issued));
+    println!("FSP paid to the service in all: {}", show(&r.fsp.paid));
+    println!();
+    let e = &r.esp_reserve;
+    println!("ESP held in reserve (kept from issues):");
+    println!(
+        "  matured    {} notes, {}",
+        e.matured.notes,
+        show(&e.matured.esp)
+    );
+    println!(
+        "  unmatured  {} notes, {}",
+        e.unmatured.notes,
+        show(&e.unmatured.esp)
+    );
+    println!(
+        "  total      {} notes, {}",
+        e.total.notes,
+        show(&e.total.esp)
+    );
+    println!(
+        "  of the total, written out by export-esp: {}",
+        show(&e.total.exported_esp)
+    );
+    for d in &e.by_day {
+        println!(
+            "    redeemable after day {} ({}): {} notes, {}",
+            d.redeemable_after_day,
+            if d.matured { "matured" } else { "unmatured" },
+            d.notes,
+            show(&d.esp)
+        );
+    }
+    for w in &r.warnings {
+        println!();
+        println!("WARNING: {w}");
     }
 }
 

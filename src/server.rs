@@ -279,12 +279,44 @@ async fn spend_handler(State(s): State<Arc<FspState>>, headers: HeaderMap, body:
     }
 }
 
+/// The audit (`GET /audit`): outstanding FSP per key set and in total, and the
+/// ESP held in reserve, matured and unmatured. See [`crate::audit`].
+pub fn audit_report(s: &FspState, now: u64) -> Result<crate::audit::Report, String> {
+    // The spend side first, then the issue side: a spend only uses FSP that
+    // was already issued, so this order cannot show more spent than issued.
+    let view = s.spender.audit_view(now)?;
+    let issues = s
+        .issues
+        .lock()
+        .map_err(|_| "the issue lock is poisoned".to_string())?;
+    Ok(crate::audit::build(now, &view, &issues.data))
+}
+
+async fn audit(State(s): State<Arc<FspState>>) -> Reply {
+    // The issue lock is held across a whole issue (including the calls to the
+    // Issuer), so wait for it off the async threads.
+    let now = (s.clock)();
+    match tokio::task::spawn_blocking(move || audit_report(&s, now)).await {
+        Ok(Ok(report)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(report).unwrap_or_default()),
+        ),
+        Ok(Err(e)) => error(500, sp_wire::codes::INTERNAL, &e),
+        Err(e) => error(
+            500,
+            sp_wire::codes::INTERNAL,
+            &format!("audit task failed: {e}"),
+        ),
+    }
+}
+
 pub fn router(state: Arc<FspState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/keys", get(keys))
         .route("/fees", get(fees))
         .route("/rotation", get(rotation))
+        .route("/audit", get(audit))
         .route("/issue", post(issue_handler))
         .route("/spend", post(spend_handler))
         .with_state(state)
