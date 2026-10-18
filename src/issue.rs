@@ -34,8 +34,9 @@ use std::path::{Path, PathBuf};
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
 use rand::rngs::OsRng;
 use secp256k1::schnorr::Signature;
-use secp256k1::{Keypair, SECP256K1, SecretKey, XOnlyPublicKey};
+use secp256k1::{Keypair, SECP256K1, SecretKey};
 use serde::{Deserialize, Serialize};
+use sp_wire::ServiceDid;
 use sp_wire::esp::transfer::{self, TransferRequest};
 
 use crate::api::{GroupResult, IssueRequest, IssueResponse, issue_group_size};
@@ -190,7 +191,7 @@ fn internal(e: impl std::fmt::Display) -> IssueError {
 
 /// What an issue needs from the rest of the mint.
 pub struct IssueContext<'a> {
-    pub service: XOnlyPublicKey,
+    pub service: ServiceDid,
     pub service_keypair: &'a Keypair,
     pub fee_per_byte: u64,
     pub current: &'a Keyset,
@@ -353,7 +354,7 @@ fn build_transfer(
             spend_signature: dummy,
         })
         .collect();
-    let service = service_keypair.x_only_public_key().0;
+    let service = ServiceDid::from(service_keypair.public_key());
     let digest = transfer::digest(&service, group.redeemable_after_day, &inputs, &outputs);
     for (input, n) in inputs.iter_mut().zip(&group.notes) {
         let kp = Keypair::from_secret_key(SECP256K1, &n.spend_secret);
@@ -665,7 +666,7 @@ mod tests {
 
     fn request(days: &[u64]) -> IssueRequest {
         IssueRequest {
-            service: kp(1).x_only_public_key().0,
+            service: ServiceDid::from(kp(1).public_key()),
             groups: days
                 .iter()
                 .map(|&d| IssueGroup {
@@ -682,7 +683,7 @@ mod tests {
         let (_issues, keys, d) = setup("limits");
         let service_kp = kp(1);
         let ctx = IssueContext {
-            service: service_kp.x_only_public_key().0,
+            service: ServiceDid::from(service_kp.public_key()),
             service_keypair: &service_kp,
             fee_per_byte: 0,
             current: keys.current(),
@@ -708,7 +709,7 @@ mod tests {
         let (mut issues, keys, d) = setup("flaky");
         let service_kp = kp(1);
         let ctx = IssueContext {
-            service: service_kp.x_only_public_key().0,
+            service: ServiceDid::from(service_kp.public_key()),
             service_keypair: &service_kp,
             fee_per_byte: 0,
             current: keys.current(),
@@ -775,7 +776,7 @@ mod tests {
         let (mut issues, keys, _) = setup("checks");
         let service_kp = kp(1);
         let mut ctx = IssueContext {
-            service: service_kp.x_only_public_key().0,
+            service: ServiceDid::from(service_kp.public_key()),
             service_keypair: &service_kp,
             fee_per_byte: 0,
             current: keys.current(),
@@ -887,7 +888,7 @@ mod tests {
         let (mut issues, keys, _) = setup("cache-ttl");
         let service_kp = kp(1);
         let mut ctx = IssueContext {
-            service: service_kp.x_only_public_key().0,
+            service: ServiceDid::from(service_kp.public_key()),
             service_keypair: &service_kp,
             fee_per_byte: 0,
             current: keys.current(),
@@ -916,7 +917,7 @@ mod tests {
         let (mut issues, keys, _) = setup("cache-retired");
         let service_kp = kp(1);
         let ctx = IssueContext {
-            service: service_kp.x_only_public_key().0,
+            service: ServiceDid::from(service_kp.public_key()),
             service_keypair: &service_kp,
             fee_per_byte: 0,
             current: keys.current(),
@@ -942,7 +943,7 @@ mod tests {
         let (mut issues, keys, _) = setup("cache-502");
         let service_kp = kp(1);
         let mut ctx = IssueContext {
-            service: service_kp.x_only_public_key().0,
+            service: ServiceDid::from(service_kp.public_key()),
             service_keypair: &service_kp,
             fee_per_byte: 0,
             current: keys.current(),

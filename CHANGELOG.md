@@ -2,6 +2,17 @@
 
 fsp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.5.0 (unreleased)
+
+**Wire version 3: the service ID is the 33-byte AIR DID.** Builds on `sp-wire` 0.5.0 (`WIRE_VERSION` 3) and mint-core 0.1.3; `Cargo.toml` still names `sp-wire` and the `esp-mint` test dependency by their old tags, which move when the new releases are tagged (until then the tests run against local copies, see the README of `sp-wire`). No migration and no dual format.
+
+- **`service.did` (`FSP_SERVICE_DID`) is the DID: 66 hex characters starting `02` or `03`.** The 32-byte x-only form is refused when the config loads, with a message that says to use the DID. `Config::service()` returns an `sp_wire::ServiceDid`.
+- **`fsp-mint service-key` prints the DID** (the key's compressed public key), and the startup check compares the whole DID with `service_key.hex`, the parity byte included: a `service.did` that differs from the key's only in `02` and `03` stops the mint with "They must match".
+- **The service in `GET /keys`, `POST /issue`, the transfer to the Issuer and `export-esp` is the 66-character DID.** A request naming another DID (a different parity counts) is `wrong_service`. The transfer to esp-mint is still signed with BIP340 and checked there against the x-only half.
+- `storage.mint_state` takes DIDs, not x-only keys.
+- **Files written by 0.4.0 that hold a service** (a pending entry in `issues.json`) **do not load.** There is nothing to migrate: start with a clean data folder.
+- Tests: the config checks (a DID is valid, the x-only form is refused, an uppercase DID is lowercased), the storage setting, `issue.rs` and `tests/fsp_flow.rs` use the DID of the service key.
+
 ## 0.4.0 (2026-10-17)
 
 - Test helpers take `&Path` instead of `&PathBuf` (lint). Documentation: the storage requirements are the numbered set (1 to 8), and the service files and health monitor are described by the SPI repository, not by a folder outside this repo. Every fee setting defaults to 0 (`fees.issue_fee_per_byte` is the only one), stated in the README.

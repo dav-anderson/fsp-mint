@@ -20,7 +20,8 @@ use fsp_mint::server::{self, FspState};
 use fsp_mint::spend::Spender;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
 use rand::rngs::OsRng;
-use secp256k1::{Keypair, PublicKey, SECP256K1, SecretKey, XOnlyPublicKey};
+use secp256k1::{Keypair, PublicKey, SECP256K1, SecretKey};
+use sp_wire::ServiceDid;
 use tokio::runtime::Runtime;
 
 const NOW: u64 = 1_791_571_184;
@@ -43,8 +44,8 @@ fn service_keypair() -> Keypair {
     Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&b).unwrap())
 }
 
-fn service() -> XOnlyPublicKey {
-    service_keypair().x_only_public_key().0
+fn service() -> ServiceDid {
+    ServiceDid::from(service_keypair().public_key())
 }
 
 struct NoPsp;
@@ -88,7 +89,7 @@ fn start_esp(rt: &Runtime, dir: &Path) -> (String, Arc<EspState>) {
 }
 
 /// An ESP note the Issuer issued for `service` and `day`.
-fn esp_note(state: &EspState, units: u64, service: XOnlyPublicKey, day: u64) -> HandedEsp {
+fn esp_note(state: &EspState, units: u64, service: ServiceDid, day: u64) -> HandedEsp {
     let terms = Terms {
         service,
         redeemable_after_day: day,
@@ -368,7 +369,7 @@ fn issue_mixed_days_keeps_the_esp_and_never_issues_twice() {
 
     // Wrong service and not exact are refused before anything.
     let mut wrong = req.clone();
-    wrong.service = Keypair::new(SECP256K1, &mut OsRng).x_only_public_key().0;
+    wrong.service = ServiceDid::from(Keypair::new(SECP256K1, &mut OsRng).public_key());
     assert_eq!(
         post(&format!("{}/issue", f.url), &wrong).1["code"],
         "wrong_service"

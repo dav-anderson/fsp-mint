@@ -13,6 +13,7 @@ use fsp_mint::server::{self, FspState};
 use fsp_mint::spend::Spender;
 use fsp_mint::store;
 use secp256k1::{Keypair, SECP256K1, SecretKey};
+use sp_wire::ServiceDid;
 
 const KEY_FILE: &str = "service_key.hex";
 
@@ -57,16 +58,17 @@ fn load_key(dir: &Path, cfg: &Config) -> Result<Keypair, String> {
         .and_then(|b| SecretKey::from_slice(&b).ok())
         .ok_or_else(|| format!("{} is damaged", path.display()))?;
     let kp = Keypair::from_secret_key(SECP256K1, &sk);
+    // The whole DID is compared, the parity byte too: a DID that differs from
+    // the key's only in 02 and 03 is another service.
+    let own = ServiceDid::from(kp.public_key());
     match cfg.service() {
-        Some(did) if did == kp.x_only_public_key().0 => Ok(kp),
+        Some(did) if did == own => Ok(kp),
         Some(did) => Err(format!(
-            "service.did is {did}, but {} holds the key for {}. They must match",
-            path.display(),
-            kp.x_only_public_key().0
+            "service.did is {did}, but {} holds the key for {own}. They must match",
+            path.display()
         )),
         None => Err(format!(
-            "service.did is not set. Set it to {} (the key in {})",
-            kp.x_only_public_key().0,
+            "service.did is not set. Set it to {own} (the key in {})",
             path.display()
         )),
     }
@@ -140,9 +142,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .ok_or_else(|| format!("{} is damaged", path.display()))?;
             println!(
                 "service.did = {}",
-                Keypair::from_secret_key(SECP256K1, &sk)
-                    .x_only_public_key()
-                    .0
+                ServiceDid::from(Keypair::from_secret_key(SECP256K1, &sk).public_key())
             );
             Ok(())
         }

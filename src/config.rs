@@ -11,6 +11,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use sp_wire::ServiceDid;
 use sp_wire::storage::StoragePolicy;
 
 pub const FILE_NAME: &str = "fsp-mint.toml";
@@ -55,8 +56,8 @@ pub const SPECS: &[Spec] = &[
         key: "service.did",
         env: "FSP_SERVICE_DID",
         default: "",
-        units: "x-only key",
-        what: "The service's DID public key (x-only, 64 hex). Only ESP named for it is accepted. The secret half is service_key.hex in the data folder (fsp-mint service-key makes it) and must match. Required by serve.",
+        units: "DID (66 hex)",
+        what: "The service's ID: its AIR DID, a 33-byte compressed public key (66 hex characters, starting 02 or 03; the old 32-byte x-only form is refused). Only ESP named for it is accepted. The secret half is service_key.hex in the data folder (fsp-mint service-key makes it) and must match. Required by serve.",
     },
     Spec {
         key: "fees.issue_fee_per_byte",
@@ -132,8 +133,8 @@ pub const SPECS: &[Spec] = &[
         key: "storage.mint_state",
         env: "FSP_STORAGE_MINT_STATE",
         default: "",
-        units: "service IDs",
-        what: "Which AIR services keep this mint's state (keys, spent lists, records), as an ordered list of service IDs: index 0 is the primary and the rest are secondaries, in the order they would be promoted. A service ID is a 32-byte x-only key in hex (64 characters); a 33-byte DID key is reduced to it. In the environment the IDs are separated by commas; in the file it is an array of strings or one such string. One entry: that service holds the state and the mint keeps a local backup copy. Empty (the default): local only. At most 8, no duplicates. Setting only for now: nothing reads or writes the AIR yet (see DESIGN.md in sandbox-mint, \"AIR storage requirements\").",
+        units: "service DIDs (66 hex characters)",
+        what: "Which AIR services keep this mint's state (keys, spent lists, records), as an ordered list of service IDs: index 0 is the primary and the rest are secondaries, in the order they would be promoted. A service ID is the service's AIR DID, a 33-byte compressed key in hex (66 characters, starting 02 or 03); the old 32-byte x-only form is refused. In the environment the IDs are separated by commas; in the file it is an array of strings or one such string. One entry: that service holds the state and the mint keeps a local backup copy. Empty (the default): local only. At most 8, no duplicates. Setting only for now: nothing reads or writes the AIR yet (see DESIGN.md in sandbox-mint, \"AIR storage requirements\").",
     },
 ];
 
@@ -274,11 +275,10 @@ impl Config {
                 self.esp_keyset_ttl_secs
             ));
         }
-        if !self.service_did.is_empty() && self.service().is_none() {
-            p.push(format!(
-                "service.did = `{}` must be a 32-byte x-only key in hex",
-                self.service_did
-            ));
+        if !self.service_did.is_empty() {
+            if let Err(e) = ServiceDid::parse(&self.service_did) {
+                p.push(format!("service.did: {e}"));
+            }
         }
         if self.issue_fee_per_byte > 1_000_000_000_000 {
             p.push(format!(
@@ -325,10 +325,9 @@ impl Config {
         if p.is_empty() { Ok(()) } else { Err(p) }
     }
 
-    /// The service's DID key, if set and valid.
-    pub fn service(&self) -> Option<secp256k1::XOnlyPublicKey> {
-        let bytes = hex::decode(&self.service_did).ok()?;
-        secp256k1::XOnlyPublicKey::from_slice(&bytes).ok()
+    /// The service's DID, if set and valid.
+    pub fn service(&self) -> Option<ServiceDid> {
+        ServiceDid::parse(&self.service_did).ok()
     }
 
     /// The rotation settings. The first issue comes from the data folder
@@ -519,8 +518,8 @@ mod tests {
 
     #[test]
     fn the_storage_policy_comes_from_the_file_and_the_environment() {
-        const A: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-        const B: &str = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+        const A: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        const B: &str = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
         let dir = dir("storage");
         let first = load(&dir, &no_env).unwrap();
         assert!(first.config.storage_mint_state.is_local_only());
@@ -541,10 +540,8 @@ mod tests {
             format!("{A},{B}")
         );
 
-        // The environment wins over the file. One entry is valid, and a DID key
-        // is reduced to its service.
-        let did = format!("02{A}");
-        let l = load(&dir, &env_of(&[("FSP_STORAGE_MINT_STATE", did.as_str())])).unwrap();
+        // The environment wins over the file. One entry is valid.
+        let l = load(&dir, &env_of(&[("FSP_STORAGE_MINT_STATE", A)])).unwrap();
         assert_eq!(l.config.storage_mint_state.to_config_string(), A);
         assert!(l.config.storage_mint_state.secondaries().is_empty());
         assert_eq!(
@@ -607,11 +604,21 @@ mod tests {
         let mut c = Config::default();
         c.set(
             "service.did",
-            "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798",
+            "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798",
         )
         .unwrap();
         c.validate().unwrap();
         assert!(c.service().is_some());
+        // The 32-byte x-only form of wire version 2 is refused, and says why.
+        let mut old = Config::default();
+        old.set(
+            "service.did",
+            "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798",
+        )
+        .unwrap();
+        let errors = old.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("x-only")), "{errors:?}");
+        assert!(old.service().is_none());
         assert_eq!(c.rotation().activation_secs, 8760 * 3600);
         assert_eq!(c.rotation().period_secs, 8760 * 3600);
         c.set("rotation.activation_hours", "0").unwrap();

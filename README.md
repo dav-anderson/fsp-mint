@@ -11,10 +11,10 @@ fsp-mint builds from tagged dependencies: mint-core at `v0.1.3` and `sp-wire` at
 ```
 cargo run -- config
 cargo run -- service-key
-FSP_SERVICE_DID=<key> cargo run -- serve
+FSP_SERVICE_DID=<DID, 66 hex characters> cargo run -- serve
 ```
 
-`config` prints the settings in use. `service-key` makes `service_key.hex` and prints the public key to put in `service.did`. Start esp-mint first: fsp-mint checks its network at startup and sends it the ESP it accepts.
+`config` prints the settings in use. `service-key` makes `service_key.hex` and prints the service's DID (the 33-byte public key, 66 hex characters) to put in `service.did`. Start esp-mint first: fsp-mint checks its network at startup and sends it the ESP it accepts.
 
 ## Settings
 
@@ -25,7 +25,7 @@ FSP_SERVICE_DID=<key> cargo run -- serve
 | `server.network` | `FSP_NETWORK` | `main` | `main`, `regtest`, `signet`, `testnet`. Checked at startup against the ESP mint's `/health`; a mismatch stops the mint. Also picks the data folder. |
 | `server.bind` | `FSP_BIND` | `127.0.0.1:3200` | The HTTP API's address. |
 | `server.max_request_bytes` | `FSP_MAX_REQUEST_BYTES` | `1048576` | Ceiling on a request body, checked before parsing. 4096 to 1 GiB. |
-| `service.did` | `FSP_SERVICE_DID` | none | The service's DID (x-only key, hex). Only ESP named for it is accepted. Required to serve. |
+| `service.did` | `FSP_SERVICE_DID` | none | The service's DID: its 33-byte compressed public key, 66 hex characters starting `02` or `03`. The old 32-byte x-only form is refused. Only ESP named for it is accepted. Required to serve. |
 | `fees.issue_fee_per_byte` | `FSP_ISSUE_FEE_PER_BYTE` | `0` | ESP to FSP fee, per byte of each issue group. |
 | `rotation.activation_hours` | `FSP_ROTATION_ACTIVATION_HOURS` | `8760` | Whole hours from the first issue to the first rotation. **0 turns rotation off.** 0 to 876000. |
 | `rotation.period_hours` | `FSP_ROTATION_PERIOD_HOURS` | `8760` | Whole hours between rotations. 1 to 876000; **0 is refused**, not an off switch here (use `activation_hours = 0`). No policy minimum, see [DESIGN.md](DESIGN.md), "No minimum period, and why". |
@@ -36,7 +36,7 @@ FSP_SERVICE_DID=<key> cargo run -- serve
 | `esp.url` | `FSP_ESP_URL` | `http://127.0.0.1:3100` | The ESP mint (Issuer) where accepted ESP is transferred. |
 | `esp.timeout_secs` | `FSP_ESP_TIMEOUT_SECS` | `30` | How long one ESP mint call may take. 1 to 600. |
 | `esp.keyset_ttl_secs` | `FSP_ESP_KEYSET_TTL_SECS` | `3600` | How long the cached ESP (Issuer) current keyset is used before it is read again; refreshed at once on `keyset_retired`. A failed read uses the cached set. 1 to 604800. |
-| `storage.mint_state` | `FSP_STORAGE_MINT_STATE` | none (local only) | Service IDs (64 hex, comma-separated) that will keep the mint's state; index 0 is the primary. One is valid; at most 8. **Setting only: nothing reads or writes the AIR yet.** See [DESIGN.md](DESIGN.md), "Storage policy". |
+| `storage.mint_state` | `FSP_STORAGE_MINT_STATE` | none (local only) | Service DIDs (66 hex, comma-separated) that will keep the mint's state; index 0 is the primary. One is valid; at most 8. **Setting only: nothing reads or writes the AIR yet.** See [DESIGN.md](DESIGN.md), "Storage policy". |
 
 **Every fee defaults to 0.** `fees.issue_fee_per_byte` is the only fee setting in fsp-mint, and with it at 0 an issue costs no more than the ESP it exchanges. A fee is charged only if the operator sets one.
 
