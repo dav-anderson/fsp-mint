@@ -2,11 +2,11 @@
 //!
 //! **Outstanding FSP.** For each key set, `issued + change - spent`:
 //!
-//! - `issued` is the FSP signed for the key set by `POST /issue`. It is counted
+//! - `issued` is the FSP signed for the key set by an issue (kind 11). It is counted
 //!   in `issues.json`, in the same atomic save that stores the answer, so a
 //!   crash cannot separate the counter from the issue it counts, and a retried
 //!   request (a stored answer) is never counted twice.
-//! - `change` is the FSP signed by `POST /spend` as change, and `spent` is the
+//! - `change` is the FSP signed by a spend (kind 12) as change, and `spent` is the
 //!   value of the notes a spend used up. Both are written in the spend's own
 //!   log line (`spends-<keyset>.jsonl`), so the counters are rebuilt from the
 //!   logs at every start. A spend that was never answered is not in the log and

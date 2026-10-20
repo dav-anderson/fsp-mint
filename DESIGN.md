@@ -1,13 +1,13 @@
 # fsp-mint: design notes
 
-How fsp-mint is built, and why. The README has the build, the settings, the commands and the HTTP API; this file has the reasoning. The sections were moved here from the README as they were, except where noted in [CHANGELOG.md](CHANGELOG.md).
+How fsp-mint is built, and why. The README has the build, the settings, the commands and the API; this file has the reasoning. The sections were moved here from the README as they were, except where noted in [CHANGELOG.md](CHANGELOG.md).
 
 ## Design
 
 How fsp-mint is built, and why. Each item says what the design is and gives the reason.
 
 1. **The service operator runs fsp-mint and holds the service's DID key.** fsp-mint does the ESP transfer at the Issuer (esp-mint) itself, signed by the service, and keeps the ESP it receives to redeem later. The key is `service_key.hex` in the network's data folder (owner-only permissions), made by `fsp-mint service-key`. *Why:* the ESP must be moved to notes only the service controls before FSP is issued against it, and the mint that issues FSP is the only party that can do both steps under one stored request; a separate wallet step would leave a gap where FSP is issued against ESP the app could still spend.
-2. **The app sends one request: `POST /issue` with its handed-over ESP notes (each with its spend secret) and its blinded FSP outputs.** The request is in groups, one per redeemable-after day. A failure between the ESP transfer and the FSP issuance is handled by a stored pending entry (below, "Crash ordering").
+2. **The app sends one request, an FSP issue call (AIR kind 11; it was `POST /issue`), with its handed-over ESP notes (each with its spend secret) and its blinded FSP outputs.** The request is in groups, one per redeemable-after day. A failure between the ESP transfer and the FSP issuance is handled by a stored pending entry (below, "Crash ordering").
 3. **Answers are stored by request hash**, as esp-mint does for exchange and transfer. A retry of the same request gets the same answer, or finishes the pending one. *Why:* a lost reply must never issue twice or not at all.
 4. **FSP ignores ESP maturity.** FSP is spendable at once, and one issue may mix ESP of several days. *Why:* the day only matters when the service redeems the ESP with the Issuer; for the app, a point at the service is a point at the service. The service carries the wait until the ESP matures (`ecash-wallet esp-schedule` shows when).
 5. **FSP is 1:1 with ESP units** (10^-12 USD per unit; amounts are `u64`, sums are checked), **in power-of-two denominations**, like PSP and ESP.
@@ -23,14 +23,14 @@ One issue spans two mints run by different operators, so it runs as a stored ent
 2. A stored answer for this request hash is returned as it is; a pending entry is picked up where it stopped.
 3. No ESP note or FSP output of the request may be held by another pending issue, and no ESP note may have been kept before (reserved inputs and outputs).
 4. One ESP transfer per group is built (the app's notes in, fresh ESP notes of the same sizes out, signed by each note's secret and by the service's DID key). **The pending entry, with the transfers and the new notes' secrets, is written to `issues.json` before anything is sent.**
-5. Each transfer is sent. Done: the new ESP notes are unblinded and kept. Refused (`400`, nothing burned at the Issuer): that group gets no FSP. Unknown (no reply over AIR after the tries, "cannot answer now", `409`, `5xx`): the request answers `502` and stays pending; a retry sends the same transfer, which the Issuer answers from its own store. See "The Issuer over AIR".
+5. Each transfer is sent. Done: the new ESP notes are unblinded and kept. Refused (`400`, nothing burned at the Issuer): that group gets no FSP. Unknown (no reply over AIR after the tries, "cannot answer now", `409`, `5xx`): the request is answered with a signed "cannot answer now" (the `502` of the HTTP route) and stays pending; a retry sends the same transfer, which the Issuer answers from its own store. See "The Issuer over AIR".
 6. When every group is settled, the FSP outputs of the transferred groups are signed (deterministic, so a crash here just signs again), the answer is stored, and returned.
 
 *Why this order:* writing the pending entry first means a crash at any point leaves either nothing sent, or a transfer the Issuer will answer the same way again. The ESP can be transferred only once at the Issuer and the FSP answer only once here, so nothing is issued twice and nothing is lost.
 
 ## The Issuer over AIR
 
-fsp-mint reaches the ESP mint (the Issuer) over AIR and no other way. There is no HTTP path to it and no switch: `esp_air::AirIssuer` is the only `Issuer`, and `serve` refuses to start without `air.esp_did`, `air.server` and `air.host`. *Why:* the FSP mint runs on the AIR service's machine and the ESP mint on the SPI's, so every call between them is party to party, and AIR is how those calls are made (signed replies, no open port on the ESP mint). A fallback to HTTP would keep that port open and would have to be kept in step.
+fsp-mint reaches the ESP mint (the Issuer) over AIR and no other way. There is no HTTP path to it and no switch: `esp_air::AirIssuer` is the only `Issuer`, and `serve` refuses to start without `air.esp_did`, `air.esp_server` and `air.esp_host` (and, for its own listener, `air.server` and `air.host`). *Why:* the FSP mint runs on the AIR service's machine and the ESP mint on the SPI's, so every call between them is party to party, and AIR is how those calls are made (signed replies, no open port on the ESP mint). A fallback to HTTP would keep that port open and would have to be kept in step.
 
 Three calls, each a request sealed to the ESP mint's DID and answered by its own AIR listener (`sp_wire::air_request::ask`, the flow the wallet uses):
 
@@ -52,9 +52,9 @@ Three calls, each a request sealed to the ESP mint's DID and answered by its own
 
 ## Spending (the fast path)
 
-`POST /spend` takes FSP inputs (each with its keyset ID, its proof and a spend signature), change outputs, the amount paid and a memo. Order of checks: shape and amounts (no lock), the stored answer, keysets and signatures (no lock), then the spent lists (under the lock), then sign and write. Inputs must be on the current or previous keyset; change is signed with the current one.
+The FSP spend call (AIR kind 12; it was `POST /spend`) takes FSP inputs (each with its keyset ID, its proof and a spend signature), change outputs, the amount paid and a memo. Order of checks: shape and amounts (no lock), the stored answer, keysets and signatures (no lock), then the spent lists (under the lock), then sign and write. Inputs must be on the current or previous keyset; change is signed with the current one.
 
-**ESP keysets on `POST /issue`.** Each handed ESP note names the ESP keyset that signed it (`keyset`, 16 hex; `400 missing_keyset` without it). The transfer to the Issuer names those keysets for its inputs and, for its outputs, the Issuer's current keyset when the issue is accepted (fixed then, so a retry sends the same transfer). That keyset is **cached**: read from esp-mint over AIR (a keysets request, see "The Issuer over AIR"), used for `esp.keyset_ttl_secs` (default 3600 s), then read again. The Issuer signs with any live keyset, so a cached keyset that has only become the previous one still works. If the Issuer answers a transfer `keyset_retired` (the cached keyset was deleted), the cache is dropped at once, the keyset read again, the group's ESP outputs re-blinded for it (nothing was burned) and the transfer sent once more. If a read fails, the cached keyset is used; only with none cached is the issue refused `502 issuer_unavailable` (nothing stored). The cache is in memory, so a restart reads it again.
+**ESP keysets on the issue call.** Each handed ESP note names the ESP keyset that signed it (`keyset`, 16 hex; `400 missing_keyset` without it). The transfer to the Issuer names those keysets for its inputs and, for its outputs, the Issuer's current keyset when the issue is accepted (fixed then, so a retry sends the same transfer). That keyset is **cached**: read from esp-mint over AIR (a keysets request, see "The Issuer over AIR"), used for `esp.keyset_ttl_secs` (default 3600 s), then read again. The Issuer signs with any live keyset, so a cached keyset that has only become the previous one still works. If the Issuer answers a transfer `keyset_retired` (the cached keyset was deleted), the cache is dropped at once, the keyset read again, the group's ESP outputs re-blinded for it (nothing was burned) and the transfer sent once more. If a read fails, the cached keyset is used; only with none cached is the issue refused `502 issuer_unavailable` (nothing stored). The cache is in memory, so a restart reads it again.
 
 **Request hashes cover every keyset field.** The issue hash (`fsp-mint/issue-request/v2`) includes each handed ESP note's `keyset` with its length; the spend hash (`fsp-mint/spend-request/v2`) adds every input keyset, length-prefixed, to the digest. Two requests that differ only in a keyset never share a hash. The kept ESP records the keyset the Issuer's reply names, and `export-esp` writes it into the hand-over so the service's wallet names it when it redeems. The FSP outputs are signed with the keyset chosen at acceptance, or the current one if that has since been deleted, and every reply, stored ones included, names the keyset that signed it.
 
@@ -84,7 +84,7 @@ Two figures, both counted where the thing happens, so that a crash cannot leave 
 
 The request and response bodies (`IssueRequest`, `SpendRequest` and the rest of `src/api.rs`), their hashes and digests, the size helper `issue_group_size` and the error codes are defined in the `sp-wire` crate, not here. `src/api.rs` re-exports them, so `fsp_mint::api::*` is unchanged. The transfer request this mint sends to the ESP mint is the `sp-wire` type too. The wallet and the other mints build against the same crate, so they cannot drift from this mint by a byte.
 
-`GET /health` returns `wire_version`, the crate's `WIRE_VERSION`. **Changing any encoded byte or JSON field in `sp-wire` means bumping `WIRE_VERSION`**, and a wallet refuses a mint that reports another number. Golden-bytes and size tests in `sp-wire` fail if a byte moves.
+The mint info (AIR kind 1, and `GET /health` on loopback) returns `wire_version`, the crate's `WIRE_VERSION`. **Changing any encoded byte or JSON field in `sp-wire` means bumping `WIRE_VERSION`**, and a wallet refuses a mint that reports another number. Golden-bytes and size tests in `sp-wire` fail if a byte moves.
 
 ## Key rotation
 
@@ -129,7 +129,7 @@ There is no policy minimum. The unit is whole hours and the period can be set as
 
 ### In fsp-mint
 
-- Keysets are in `keysets.json`; the first-issue time in `first_issue.json`, written at the first `POST /issue` that issues anything, never changed. Before it exists, or with `rotation.activation_hours = 0`, there is one keyset (epoch 0).
+- Keysets are in `keysets.json`; the first-issue time in `first_issue.json`, written at the first issue that issues anything, never changed. Before it exists, or with `rotation.activation_hours = 0`, there is one keyset (epoch 0).
 - Epochs: the first rollover is at first issue + activation hours, then one every `rotation.period_hours`. The mint rolls over when the clock passes a boundary (checked on each request), makes the new keyset, and deletes the one two back with its spent list and log.
 - Notes of the previous set can be spent and swapped until the next rotation; change and new FSP are always on the current set.
 - `cargo run -- config` and the startup log print the first issue, the activation and the next rotation.
@@ -138,7 +138,18 @@ There is no policy minimum. The unit is whole hours and the period can be set as
 
 Fees are charged on requests that carry value. A junk request that carries no value (a malformed body, a note that does not verify, a replay of a spent note) pays nothing, because it is refused before there is anything to charge. So fees do not protect against denial of service; the body ceiling and cheap checks first are what limit the cost of such a request. Per-DID and per-connection rate limits at the AIR layer are a possible further mitigation, not yet explored.
 
-## `GET /rotation`
+## Wallets reach the mint over AIR
+
+Before 0.6.0 wallets called `POST /issue`, `POST /spend`, `GET /keys`, `GET /fees`, `GET /rotation` and `GET /health` over HTTP. Now fsp-mint has its own AIR listener (`src/air_listener.rs`, always running under `serve`) under the service's DID, and those calls are AIR kinds: 1 (mint info, the health JSON), 2 (keys), 4 (rotation), 7 (fees), and two new ones, 11 (FSP issue) and 12 (FSP spend), in `sp-wire`. The wire is REQUEST-DESIGN.md section 17 (sandbox-mint); what is specific to fsp-mint:
+
+- **One listener, one DID.** The requests are sealed to `service.did` and the replies are signed by the key `load_key` already checks against it (`service_key.hex`): no new key. psp-mint and esp-mint have the same listener shape (`air_listener::run`, held reads, a counter file `air_mailbox_next`, one request at a time in slot order, exit 1 if it fails). A request is answered by `server::air_served(state, kind, body)`, which calls the same outcome functions the HTTP routes called, so the logic is not duplicated; `Served::Body` is the route's exact JSON, `Served::Refused` carries a `4xx` (a `400` as the route's body, anything else with `"http_status": N`), and `Served::Unavailable` a `5xx`.
+- **Idempotency is the mint's own.** An issue is found again by its request hash and a spend by its notes, so a wallet that resends after a lost reply, or after a signed "cannot answer now", gets the stored answer and nothing is done twice. A signed "cannot answer now" is how an ESP mint that does not answer fsp-mint reaches the wallet (the issue is left pending, as it was with the `502`).
+- **Blocking work.** The listener's `serve` callback is synchronous and the spend path is async, so `server.rs` runs the async spend on a runtime built for the call (`block_on_new_runtime`); the issue logic blocks (the issue lock is held across the calls to the ESP mint) and is called directly.
+- **Two AIR servers.** `air.esp_server` and `air.esp_host` (with `air.esp_did`) are where the calls to the ESP mint go: the SPI's server. `air.server` and `air.host` are the listener's own, which may be the same server or another. Both pairs are configuration until DID resolution exists, and each is marked so in the settings.
+- **What is left on HTTP.** `GET /audit` and `GET /health`, on `server.bind`, which must be loopback. `/audit` is the operator's report. `/health` stays because the local health monitor (`sp-health-monitor.sh`, `ops/env/fsp-mint-health.conf.example`) polls it, the way esp-mint's does; it is SPI-local traffic and the same document wallets get over AIR. The brief said to leave only `/audit` and to stop and report before removing a route something local calls: this one is called, so it stays, and the report names it.
+- **Sizes.** The ceilings are the ones the routes had: a body over `server.max_request_bytes` is refused before it is parsed, with the same `413` JSON (as a signed refusal that carries `"http_status": 413`, so the wallet reads it as a mint error, not as a refusal of its notes). The AIR server has its own message cap, so a request AIR cannot carry never arrives at all; the tests lower the setting to a few kilobytes to reach the ceiling.
+
+## Rotation (AIR kind 4)
 
 *Why public:* a holder needs to know when its notes stop being good. psp-mint and esp-mint have the same query, in the same shape.
 
@@ -158,4 +169,4 @@ This is configuration and validation only. **Nothing reads or writes the AIR yet
 
 **Opening the data twice.** The database allows one process at a time, so a new process that starts while the old one is still stopping cannot open it; it exits with an error and the service manager starts it again. The storage that replaces sled has to give the same refusal or an equivalent single-writer guarantee, and the issue records and the spent list have to be written atomically and be durable once the call that wrote them returns, in the order "Crash ordering" gives.
 
-**Health.** `GET /health` is `200` while the spender has no fault and `503` (`status: "broken"`, with the reason) after. The health monitor of the SPI repository (`sp-health-monitor.sh`, see its README, "The health monitor") can poll it and report or restart a mint that stays unhealthy; `spi` does not set it up for fsp-mint, so the service points the script's `HEALTH_URL` at fsp-mint's `/health` itself.
+**Health.** The mint info (AIR kind 1) and `GET /health` on loopback are `200` while the spender has no fault and `503` (`status: "broken"`, with the reason) after. The health monitor of the SPI repository (`sp-health-monitor.sh`, see its README, "The health monitor") can poll it and report or restart a mint that stays unhealthy; `spi` does not set it up for fsp-mint, so the service points the script's `HEALTH_URL` at fsp-mint's `/health` itself.

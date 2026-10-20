@@ -1,4 +1,4 @@
-//! `POST /issue`: ESP named for this service in, FSP out, 1:1 less the issue
+//! The issue call (over AIR, kind 11): ESP named for this service in, FSP out, 1:1 less the issue
 //! fee.
 //!
 //! One request spans two mints with different operators: the ESP transfer at

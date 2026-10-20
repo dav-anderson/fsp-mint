@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
+use fsp_mint::air_listener;
 use fsp_mint::config::{self, Config};
 use fsp_mint::esp_air::AirIssuer;
 use fsp_mint::esp_client::{self, Issuer};
@@ -15,6 +16,7 @@ use fsp_mint::spend::Spender;
 use fsp_mint::store;
 use secp256k1::{Keypair, SECP256K1, SecretKey};
 use sp_wire::ServiceDid;
+use sp_wire::air_request::addr;
 
 const KEY_FILE: &str = "service_key.hex";
 
@@ -24,11 +26,14 @@ fsp-mint <command>
   config               Print the settings in use, and what each does.
   service-key          Make the service's DID key (service_key.hex) if there is
                        none, and print its public half for service.did.
-  serve                Run the HTTP API (POST /issue, POST /spend, GET /keys,
-                       GET /fees, GET /rotation, GET /audit, GET /health).
-                       The ESP mint is reached over AIR only: needs air.esp_did,
-                       air.server and air.host, and asks the ESP mint which
-                       network it is on before it starts.
+  serve                Run the AIR listener (the only way wallets reach this mint:
+                       mint info, keys, fees, rotation, issue and spend) and the
+                       operator's GET /audit and the health monitor's GET /health
+                       on server.bind (loopback only). Needs
+                       air.server and air.host (the listener's own AIR server)
+                       and, for the ESP mint, which is also reached over AIR
+                       only, air.esp_did, air.esp_server and air.esp_host. Asks
+                       the ESP mint which network it is on before it starts.
   audit [--json]       Print what the mint owes and holds: outstanding FSP per
                        key set and in total (in FSP units and PSP), and the ESP
                        in reserve, matured and unmatured. Reads the data files,
@@ -226,6 +231,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
             .with_max_memo_bytes(cfg.spend_max_memo_bytes as usize);
             let issues = Issues::open(&dir).map_err(|e| e.to_string())?;
             let bind = cfg.bind.clone();
+            // The listener answers with the service's own DID key: the one
+            // `load_key` has just checked against `service.did`.
+            let air = cfg.air_listener(&dir);
+            let did_key = air_key(&dir)?;
+            let own = ServiceDid::from(keypair.public_key());
+            if addr::key_to_did(&did_key.public_key()) != own {
+                return Err(format!(
+                    "the AIR key made from {} is not the service's DID {own}",
+                    dir.join(KEY_FILE).display()
+                ));
+            }
             let state = Arc::new(FspState {
                 config: cfg,
                 spender,
@@ -234,12 +250,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 service_keypair: Some(keypair),
                 clock: Box::new(fsp_mint::now_secs),
             });
+            start_air_listener(air, did_key, Arc::clone(&state))?;
             let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
             rt.block_on(async move {
                 let listener = tokio::net::TcpListener::bind(&bind)
                     .await
                     .map_err(|e| format!("cannot bind {bind}: {e}"))?;
-                println!("fsp-mint api listening on http://{bind}");
+                println!("fsp-mint api (/audit, /health) listening on http://{bind}");
                 axum::serve(listener, server::router(state))
                     .with_graceful_shutdown(async {
                         shutdown_signal().await;
@@ -251,6 +268,48 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         other => Err(format!("unknown command `{other}`. Run with --help")),
     }
+}
+
+/// The service's key as an AIR key, for the listener: the 32 bytes of
+/// `service_key.hex`.
+fn air_key(dir: &Path) -> Result<sp_wire::seal::SecretKey, String> {
+    let path = dir.join(KEY_FILE);
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    addr::secret_from_hex(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Start the AIR listener on its own thread. It answers every wallet-facing
+/// request (`server::air_served`). If it fails (the AIR client gave up) it says
+/// so and the mint exits with status 1, so that the service manager starts it
+/// again and the listener resumes from the stored slot counter: a mint that no
+/// wallet can reach is not left running.
+fn start_air_listener(
+    air: air_listener::Settings,
+    key: sp_wire::seal::SecretKey,
+    state: Arc<FspState>,
+) -> Result<(), String> {
+    println!(
+        "fsp-mint AIR listener: wallets reach this service with the air.fsp entry {}@{}@{} (ECASH_AIR_FSP, air.fsp; to be replaced by DID resolution)",
+        addr::key_to_did(&key.public_key()),
+        air.server.name.trim(),
+        air.server.host.trim()
+    );
+    std::thread::Builder::new()
+        .name("air-listener".into())
+        .spawn(move || {
+            let serve: Arc<air_listener::Serve> =
+                Arc::new(move |kind: u8, body: &[u8]| server::air_served(&state, kind, body));
+            match air_listener::run_blocking(&air, &key, &serve) {
+                Ok(()) => eprintln!("AIR listener: stopped"),
+                Err(e) => {
+                    eprintln!("AIR listener failed: {e}\nExiting so that a supervisor can restart the process");
+                    std::process::exit(1);
+                }
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    println!("AIR listener starting");
+    Ok(())
 }
 
 fn print_audit(r: &fsp_mint::audit::Report) {

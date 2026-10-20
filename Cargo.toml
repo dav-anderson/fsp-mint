@@ -30,10 +30,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync",
 
 [dev-dependencies]
 # The tests start a real esp-mint in the process, with its AIR listener, as the
-# Issuer (they need an esp-mint that has `air_listener`, which no tag has yet:
-# the local patch below).
+# Issuer, and fsp-mint's own AIR listener beside it (they need an esp-mint that
+# has `air_listener`, which no tag has yet: the local patch below).
 esp-mint = { git = "https://github.com/dav-anderson/esp-mint.git", tag = "v0.5.0" }
-# The tests call the HTTP API of this mint and of the in-process ESP mint.
+# What is left over HTTP is `/audit`, of this mint and of the in-process ESP mint:
+# the tests read it.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [lib]

@@ -68,8 +68,8 @@ impl AirIssuer {
         Ok(AirIssuer {
             cfg: AskConfig {
                 server: ServerRef {
-                    name: config.air_server.clone(),
-                    host: config.air_host.clone(),
+                    name: config.air_esp_server.clone(),
+                    host: config.air_esp_host.clone(),
                 },
                 mint,
                 wire_version: sp_wire::WIRE_VERSION,

@@ -29,7 +29,7 @@ pub const REMOVED: &[(&str, &str, &str)] = &[
     (
         "esp.url",
         "FSP_ESP_URL",
-        "`esp.url` is gone: fsp-mint reaches the ESP mint only over AIR now, not over HTTP. Set air.esp_did (the ESP mint's DID; `esp-mint pubkey` prints it), air.server and air.host (FSP_AIR_ESP_DID, FSP_AIR_SERVER, FSP_AIR_HOST) and remove esp.url",
+        "`esp.url` is gone: fsp-mint reaches the ESP mint only over AIR now, not over HTTP. Set air.esp_did (the ESP mint's DID; `esp-mint pubkey` prints it), air.esp_server and air.esp_host (FSP_AIR_ESP_DID, FSP_AIR_ESP_SERVER, FSP_AIR_ESP_HOST) and remove esp.url",
     ),
     (
         "esp.timeout_secs",
@@ -59,14 +59,14 @@ pub const SPECS: &[Spec] = &[
         env: "FSP_BIND",
         default: "127.0.0.1:3200",
         units: "host:port",
-        what: "The HTTP API's address. Must be an IP:port.",
+        what: "The address of the HTTP API that is left: the operator's `GET /audit`. Must be a loopback IP:port: wallets reach this mint over AIR only, never over HTTP.",
     },
     Spec {
         key: "server.max_request_bytes",
         env: "FSP_MAX_REQUEST_BYTES",
         default: "1048576",
         units: "bytes",
-        what: "Ceiling on a request body, as on the other mints. 4096 to 1 GiB.",
+        what: "Ceiling on a request body (an issue or a spend, as the AIR listener reads it), as on the other mints. Over it: a signed refusal with the 413 body, before anything is parsed. 4096 to 1 GiB.",
     },
     Spec {
         key: "service.did",
@@ -101,21 +101,21 @@ pub const SPECS: &[Spec] = &[
         env: "FSP_ISSUE_MAX_ITEMS",
         default: "1000",
         units: "notes",
-        what: "The most groups in one issue request, and the most ESP notes and the most FSP outputs in one group. More is refused 400 too_many_items before anything is spent. The wallet reads it from GET /fees. 1 to 100000.",
+        what: "The most groups in one issue request, and the most ESP notes and the most FSP outputs in one group. More is refused 400 too_many_items before anything is spent. The wallet reads it from the fees call. 1 to 100000.",
     },
     Spec {
         key: "spend.max_items",
         env: "FSP_SPEND_MAX_ITEMS",
         default: "1000",
         units: "notes",
-        what: "The most notes in, and the most outputs, in one spend. More is refused 400 too_many_items. The wallet reads it from GET /fees. 1 to 100000.",
+        what: "The most notes in, and the most outputs, in one spend. More is refused 400 too_many_items. The wallet reads it from the fees call. 1 to 100000.",
     },
     Spec {
         key: "spend.max_memo_bytes",
         env: "FSP_SPEND_MAX_MEMO_BYTES",
         default: "256",
         units: "bytes",
-        what: "The longest memo on a spend. A longer one is refused 400 memo_too_long before anything is spent. The wallet reads it from GET /fees. 0 to 65536.",
+        what: "The longest memo on a spend. A longer one is refused 400 memo_too_long before anything is spent. The wallet reads it from the fees call. 0 to 65536.",
     },
     Spec {
         key: "spend.max_batch",
@@ -139,18 +139,39 @@ pub const SPECS: &[Spec] = &[
         what: "The ESP mint's DID: the 33-byte compressed key of esp-mint's mint_did_key.json (`esp-mint pubkey` prints it), in hex. Where the requests to the ESP mint are sealed, and the key its replies must be signed by. Required by serve, with air.server and air.host: AIR is the only way fsp-mint reaches the ESP mint, and it has no built-in DID.",
     },
     Spec {
+        key: "air.esp_server",
+        env: "FSP_AIR_ESP_SERVER",
+        default: "",
+        units: "AIR server name (66 hex characters)",
+        what: "The name of the AIR server that carries the requests to the ESP mint (the SPI's): its public key, the compressed hex AIR prints (66 characters, starting 02 or 03). fsp-mint checks the server's signed challenge against it. To be replaced by DID resolution: resolving a mint's DID to its AIR server is not built (ROADMAP upstream item 4), so it is configuration for now. With air.esp_host and air.esp_did, it is how the three calls to the ESP mint (mint info, keysets, transfer) are made: all three are required by serve. This is not the server this mint's own listener is on (air.server).",
+    },
+    Spec {
+        key: "air.esp_host",
+        env: "FSP_AIR_ESP_HOST",
+        default: "",
+        units: "host name or IP, no port",
+        what: "Where that AIR server is: a host name or an IP with no scheme, no path and no port (the AIR client always dials port 5702 for ws). 127.0.0.1 for a server on this machine. To be replaced by DID resolution, like air.esp_server. Required by serve, with air.esp_server and air.esp_did.",
+    },
+    Spec {
         key: "air.server",
         env: "FSP_AIR_SERVER",
         default: "",
         units: "AIR server name (66 hex characters)",
-        what: "The name of the AIR server that carries the requests to the ESP mint: its public key, the compressed hex AIR prints (66 characters, starting 02 or 03). fsp-mint checks the server's signed challenge against it. Resolving a mint's DID to its AIR server is not built, so it is configuration for now. With air.host and air.esp_did, it is how the three calls to the ESP mint (mint info, keysets, transfer) are made: all three are required by serve.",
+        what: "The AIR server this mint's own listener holds reads on and writes replies to: its identity, a public key in AIR's compressed hex form (66 characters). The listener checks the server's signed challenge against it. Required by serve: the AIR listener always runs, because AIR is the only way wallets reach this mint. It is the AIR server of the service (it may be the same server as air.esp_server, or another: the DIDs differ, so the mailboxes do). To be replaced by DID resolution: a wallet is given this name beside the service's DID (its per-service `air.fsp` setting) until the AIR resolves a DID to a server (ROADMAP upstream item 4).",
     },
     Spec {
         key: "air.host",
         env: "FSP_AIR_HOST",
         default: "",
         units: "host name or IP, no port",
-        what: "Where to reach that AIR server: a host name or an IP with no scheme, no path and no port (the AIR client always dials port 5702 for ws). 127.0.0.1 for a server on this machine. Required by serve, with air.server and air.esp_did.",
+        what: "Where that AIR server is: a host name or an IP (127.0.0.1 for a server on this machine). No port: the AIR client always uses 5702 (ws). Required by serve, with air.server. To be replaced by DID resolution, like air.server.",
+    },
+    Spec {
+        key: "air.held_reads",
+        env: "FSP_AIR_HELD_READS",
+        default: "16",
+        units: "reads",
+        what: "How many mailbox slots the listener holds a read on, ahead of the next unfinished one. More lets more wallets be answered at once without waiting for a slot to be reached; each held read costs the AIR server about 2 KB. The AIR server closes the whole session at its 257th held read, so the most accepted is 200. The requests themselves are answered one at a time, in slot order. 1 to 200.",
     },
     Spec {
         key: "air.reply_wait_secs",
@@ -178,7 +199,7 @@ pub const SPECS: &[Spec] = &[
         env: "FSP_AIR_TIMEOUT_SECS",
         default: "10",
         units: "seconds (1 to 600)",
-        what: "How long the AIR server may take to answer one Create or Read before that step fails.",
+        what: "How long the AIR server may take to answer one Create or Read before that step fails (the calls to the ESP mint and this mint's own listener alike).",
     },
     Spec {
         key: "storage.mint_state",
@@ -197,10 +218,18 @@ pub struct Config {
     pub esp_keyset_ttl_secs: u64,
     /// The ESP mint's DID, for the calls over AIR.
     pub air_esp_did: Option<ServiceDid>,
-    /// The AIR server's name (its public key), or empty.
+    /// The AIR server that carries the calls to the ESP mint (its name, a
+    /// public key), or empty. To be replaced by DID resolution.
+    pub air_esp_server: String,
+    /// That server's host or IP, or empty.
+    pub air_esp_host: String,
+    /// This mint's own AIR server (the listener's), or empty. To be replaced by
+    /// DID resolution.
     pub air_server: String,
-    /// The AIR server's host or IP, or empty.
+    /// That server's host or IP, or empty.
     pub air_host: String,
+    /// Mailbox slots the listener holds a read on.
+    pub air_held_reads: u32,
     pub air_reply_wait_secs: u64,
     pub air_attempts: u64,
     pub air_max_skew_secs: u64,
@@ -225,8 +254,11 @@ impl Default for Config {
             max_request_bytes: 1024 * 1024,
             esp_keyset_ttl_secs: 3600,
             air_esp_did: None,
+            air_esp_server: String::new(),
+            air_esp_host: String::new(),
             air_server: String::new(),
             air_host: String::new(),
+            air_held_reads: 16,
             air_reply_wait_secs: 30,
             air_attempts: 3,
             air_max_skew_secs: 300,
@@ -280,8 +312,11 @@ impl Config {
             "server.max_request_bytes" => self.max_request_bytes.to_string(),
             "esp.keyset_ttl_secs" => self.esp_keyset_ttl_secs.to_string(),
             "air.esp_did" => self.air_esp_did.map(|d| d.to_hex()).unwrap_or_default(),
+            "air.esp_server" => self.air_esp_server.clone(),
+            "air.esp_host" => self.air_esp_host.clone(),
             "air.server" => self.air_server.clone(),
             "air.host" => self.air_host.clone(),
+            "air.held_reads" => self.air_held_reads.to_string(),
             "air.reply_wait_secs" => self.air_reply_wait_secs.to_string(),
             "air.attempts" => self.air_attempts.to_string(),
             "air.max_skew_secs" => self.air_max_skew_secs.to_string(),
@@ -313,7 +348,7 @@ impl Config {
                     Some(ServiceDid::parse(text).map_err(|e| format!("{key} = `{value}`: {e}"))?)
                 };
             }
-            "air.server" => {
+            "air.esp_server" | "air.server" => {
                 let text = value.trim();
                 if !text.is_empty() {
                     sp_wire::seal::parse_public_key(text).map_err(|e| {
@@ -322,15 +357,24 @@ impl Config {
                         )
                     })?;
                 }
-                self.air_server = text.to_string();
+                if key == "air.server" {
+                    self.air_server = text.to_string();
+                } else {
+                    self.air_esp_server = text.to_string();
+                }
             }
-            "air.host" => {
+            "air.esp_host" | "air.host" => {
                 let text = value.trim();
                 if let Some(why) = sp_wire::air_request::host_problem(text) {
                     return Err(format!("{key} = `{value}` {why}"));
                 }
-                self.air_host = text.to_string();
+                if key == "air.host" {
+                    self.air_host = text.to_string();
+                } else {
+                    self.air_esp_host = text.to_string();
+                }
             }
+            "air.held_reads" => self.air_held_reads = in_range(key, value, 1, 200)? as u32,
             "air.reply_wait_secs" => self.air_reply_wait_secs = in_range(key, value, 1, 600)?,
             "air.attempts" => self.air_attempts = in_range(key, value, 1, 10)?,
             "air.max_skew_secs" => self.air_max_skew_secs = in_range(key, value, 1, 86_400)?,
@@ -354,8 +398,13 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut p = Vec::new();
-        if self.bind.parse::<std::net::SocketAddr>().is_err() {
-            p.push(format!("server.bind = `{}` must be an IP:port", self.bind));
+        match self.bind.parse::<std::net::SocketAddr>() {
+            Err(_) => p.push(format!("server.bind = `{}` must be an IP:port", self.bind)),
+            Ok(addr) if !addr.ip().is_loopback() => p.push(format!(
+                "server.bind = `{}` is not a loopback address. Wallets reach this mint over AIR only; what is left on this address (/audit) is for the operator on this machine",
+                self.bind
+            )),
+            Ok(_) => {}
         }
         if !(4096..=1 << 30).contains(&self.max_request_bytes) {
             p.push(format!(
@@ -419,14 +468,22 @@ impl Config {
         if p.is_empty() { Ok(()) } else { Err(p) }
     }
 
-    /// What `serve` needs: the AIR settings, all three, because AIR is the only
-    /// way this mint reaches the ESP mint. The error names every one that is
-    /// not set. (The other commands do not talk to the ESP mint and do not need
-    /// them.)
+    /// What `serve` needs: all five AIR settings. The ESP mint is reached over
+    /// AIR only (`air.esp_did`, `air.esp_server`, `air.esp_host`), and the
+    /// listener, which always runs because AIR is the only way wallets reach this
+    /// mint, needs its own server (`air.server`, `air.host`). The error names every
+    /// one that is not set. (The other commands do not talk to the AIR and do not
+    /// need them.)
     pub fn require_air(&self) -> Result<(), String> {
         let mut missing = Vec::new();
         if self.air_esp_did.is_none() {
             missing.push("air.esp_did (FSP_AIR_ESP_DID)");
+        }
+        if self.air_esp_server.is_empty() {
+            missing.push("air.esp_server (FSP_AIR_ESP_SERVER)");
+        }
+        if self.air_esp_host.is_empty() {
+            missing.push("air.esp_host (FSP_AIR_ESP_HOST)");
         }
         if self.air_server.is_empty() {
             missing.push("air.server (FSP_AIR_SERVER)");
@@ -438,10 +495,24 @@ impl Config {
             return Ok(());
         }
         Err(format!(
-            "serve needs the AIR settings, because AIR is the only way fsp-mint reaches the ESP mint, and {} {} not set. air.esp_did is the ESP mint's DID (`esp-mint pubkey` prints it), air.server the AIR server's name and air.host where to reach it",
+            "serve needs the AIR settings, because AIR is the only way fsp-mint reaches the ESP mint and the only way wallets reach this mint, and {} {} not set. air.esp_did is the ESP mint's DID (`esp-mint pubkey` prints it), air.esp_server and air.esp_host the AIR server that carries the calls to it, and air.server and air.host the AIR server this mint's own listener is on (each a public key of 66 hex characters, and a host name or IP with no port)",
             missing.join(", "),
             if missing.len() == 1 { "is" } else { "are" }
         ))
+    }
+
+    /// The listener's settings (call [`Config::require_air`] first). `state_dir`
+    /// is the network's data folder.
+    pub fn air_listener(&self, state_dir: &Path) -> crate::air_listener::Settings {
+        crate::air_listener::Settings {
+            server: sp_wire::air_request::client::ServerRef {
+                name: self.air_server.clone(),
+                host: self.air_host.clone(),
+            },
+            held_reads: self.air_held_reads,
+            timeout_secs: self.air_timeout_secs,
+            state_dir: state_dir.to_path_buf(),
+        }
     }
 
     /// The service's DID, if set and valid.
@@ -825,17 +896,25 @@ mod tests {
             ),
             (30, 3, 300, 10)
         );
-        assert!(c.air_esp_did.is_none() && c.air_server.is_empty() && c.air_host.is_empty());
+        assert!(
+            c.air_esp_did.is_none() && c.air_esp_server.is_empty() && c.air_esp_host.is_empty()
+        );
+        assert!(c.air_server.is_empty() && c.air_host.is_empty());
+        assert_eq!(c.air_held_reads, 16);
         let mut c = Config::default();
         c.set("air.esp_did", ESP_DID).unwrap();
         assert_eq!(c.get("air.esp_did").unwrap(), ESP_DID);
         for (key, value) in [
             ("air.esp_did", "zz"),
             ("air.esp_did", &ESP_DID[2..]),
+            ("air.esp_server", "zz"),
+            ("air.esp_host", "ws://127.0.0.1"),
             ("air.server", "zz"),
             ("air.host", "ws://127.0.0.1"),
             ("air.host", "127.0.0.1:5702"),
             ("air.host", "a b"),
+            ("air.held_reads", "0"),
+            ("air.held_reads", "201"),
             ("air.attempts", "0"),
             ("air.attempts", "11"),
             ("air.reply_wait_secs", "0"),
@@ -849,24 +928,59 @@ mod tests {
     }
 
     #[test]
-    fn serve_needs_all_three_air_settings_and_names_each_missing_one() {
+    fn serve_needs_all_five_air_settings_and_names_each_missing_one() {
         let c = Config::default();
         let e = c.require_air().unwrap_err();
-        for name in ["air.esp_did", "air.server", "air.host"] {
+        for name in [
+            "air.esp_did",
+            "air.esp_server",
+            "air.esp_host",
+            "air.server",
+            "air.host",
+        ] {
             assert!(e.contains(name), "{e}");
         }
         let mut c = Config::default();
         c.set("air.esp_did", ESP_DID).unwrap();
+        c.set("air.esp_host", "127.0.0.1").unwrap();
+        c.set("air.server", ESP_DID).unwrap();
         c.set("air.host", "127.0.0.1").unwrap();
         let e = c.require_air().unwrap_err();
-        assert!(e.contains("FSP_AIR_SERVER"), "{e}");
+        assert!(e.contains("FSP_AIR_ESP_SERVER"), "{e}");
         assert!(
-            !e.contains("FSP_AIR_HOST") && !e.contains("FSP_AIR_ESP_DID"),
+            !e.contains("FSP_AIR_ESP_HOST")
+                && !e.contains("FSP_AIR_ESP_DID")
+                && !e.contains("(FSP_AIR_SERVER)")
+                && !e.contains("(FSP_AIR_HOST)"),
             "{e}"
         );
         assert!(e.contains("is not set"), "{e}");
-        c.set("air.server", ESP_DID).unwrap();
+        c.set("air.esp_server", ESP_DID).unwrap();
         assert!(c.require_air().is_ok());
+        // The listener's own server and host are the ones the listener uses.
+        let l = c.air_listener(std::path::Path::new("/x"));
+        assert_eq!((l.server.host.as_str(), l.held_reads), ("127.0.0.1", 16));
+        c.set("air.esp_host", "10.0.0.9").unwrap();
+        assert_eq!(
+            c.air_listener(std::path::Path::new("/x")).server.host,
+            "127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn server_bind_must_be_a_loopback_address() {
+        let mut c = Config::default();
+        c.set("server.bind", "0.0.0.0:3200").unwrap();
+        let p = c.validate().unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("server.bind") && x.contains("not a loopback address")),
+            "{p:?}"
+        );
+        c.set("server.bind", "[::1]:3200").unwrap();
+        assert!(c.validate().is_ok());
+        c.set("server.bind", "127.0.0.1:3200").unwrap();
+        assert!(c.validate().is_ok());
     }
 
     #[test]
@@ -879,8 +993,9 @@ mod tests {
         .unwrap();
         let p = load(&d, &no_env).unwrap_err();
         assert!(
-            p.iter()
-                .any(|x| x.contains("`esp.url` is gone") && x.contains("air.esp_did")),
+            p.iter().any(|x| x.contains("`esp.url` is gone")
+                && x.contains("air.esp_did")
+                && x.contains("air.esp_server")),
             "{p:?}"
         );
         assert!(

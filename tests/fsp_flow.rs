@@ -1,23 +1,27 @@
 //! fsp-mint end to end: a real ESP mint (the Issuer) in-process, fsp-mint in
 //! front of it, and the app side built the way the wallet builds it.
 //!
-//! fsp-mint reaches the ESP mint over AIR only, so every test here runs the ESP
-//! mint's own AIR listener against a real `air_server` started in this process
-//! (`sp_wire::air_request::local_server`), and fsp-mint's Issuer is the real
-//! `AirIssuer`. The AIR client always dials port 5702 (upstream item 12), so
-//! these tests need that port free, and they take turns on the one shared server
-//! (it has a single storage worker, so tests running in parallel starve each
-//! other past their timeouts). The ESP mint's HTTP routes are still served, but
-//! only so that the tests can read its `/audit`; fsp-mint does not call them.
+//! Both mints are reached over AIR only, so every test here runs the ESP mint's
+//! AIR listener and fsp-mint's own AIR listener against a real `air_server`
+//! started in this process (`sp_wire::air_request::local_server`). fsp-mint's
+//! Issuer is the real `AirIssuer`, and the app side asks fsp-mint's DID over AIR
+//! the way the wallet does (`tests/common`). The AIR client always dials port
+//! 5702 (upstream item 12), so these tests need that port free, and they take
+//! turns on the one shared server (it has a single storage worker, so tests
+//! running in parallel starve each other past their timeouts). Each test has its
+//! own service key, so no two tests touch the same mailbox. HTTP is left for the
+//! operator's `/audit` (fsp-mint's and the ESP mint's), which the tests read.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use esp_mint::air_listener::{self, Serve, Settings};
+use common::{Air, Listener, Server, server, start_esp_listening, start_listening};
 use esp_mint::exchange::{Burn, Psp};
 use esp_mint::responses::Responses;
 use esp_mint::server::EspState;
@@ -35,8 +39,8 @@ use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, PublicKey, SECP256K1, SecretKey};
 use sp_wire::ServiceDid;
+use sp_wire::air_request::addr;
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
-use sp_wire::air_request::{addr, local_server};
 use sp_wire::seal::SecretKey as DidKey;
 use tokio::runtime::Runtime;
 
@@ -54,10 +58,23 @@ fn scratch(name: &str) -> PathBuf {
     d
 }
 
+thread_local! {
+    /// This test's service key: a test runs on a thread of its own, and the
+    /// service's mailboxes on the shared AIR server are the DID's, so a key shared
+    /// by tests would have each one's listener read the earlier ones' requests.
+    static SERVICE_SECRET: [u8; 32] = SecretKey::new(&mut OsRng).secret_bytes();
+}
+
 fn service_keypair() -> Keypair {
-    let mut b = [0u8; 32];
-    b[31] = 1;
+    let b = SERVICE_SECRET.with(|b| *b);
     Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&b).unwrap())
+}
+
+/// The same key as the AIR listener's, made from the hex of `service_key.hex`
+/// as `fsp-mint serve` makes it.
+fn service_air_key() -> DidKey {
+    let b = SERVICE_SECRET.with(|b| *b);
+    addr::secret_from_hex(&hex::encode(b)).unwrap()
 }
 
 fn service() -> ServiceDid {
@@ -74,7 +91,8 @@ impl Psp for NoPsp {
     }
 }
 
-fn serve(rt: &Runtime, app: Router) -> String {
+/// An HTTP API on a port of its own (only `/audit` and `/health` are left).
+fn serve_http(rt: &Runtime, app: Router) -> String {
     let l = rt
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
         .unwrap();
@@ -83,82 +101,10 @@ fn serve(rt: &Runtime, app: Router) -> String {
     format!("http://{a}")
 }
 
-/// One test at a time on the shared AIR server.
-static AIR_TURN: Mutex<()> = Mutex::new(());
-
-/// The shared server plus this test's turn on it; the turn ends when this drops,
-/// whether the test passed, failed or panicked.
-struct Server {
-    server: ServerRef,
-    _turn: std::sync::MutexGuard<'static, ()>,
-}
-
-impl std::ops::Deref for Server {
-    type Target = ServerRef;
-
-    fn deref(&self) -> &ServerRef {
-        &self.server
-    }
-}
-
-fn server() -> Server {
-    let turn = AIR_TURN.lock().unwrap_or_else(|e| e.into_inner());
-    let server = local_server::start().expect("a local AIR server (is port 5702 free?)");
-    Server {
-        server,
-        _turn: turn,
-    }
-}
-
-/// The ESP mint's AIR listener on a thread of its own, as `esp-mint serve` runs
-/// it. Dropping it stops it.
-struct Listener {
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-    thread: Option<JoinHandle<Result<(), String>>>,
-}
-
-fn start_serving(server: &ServerRef, key: &DidKey, dir: &Path, serve: Arc<Serve>) -> Listener {
-    let settings = Settings {
-        server: server.clone(),
-        held_reads: 16,
-        timeout_secs: 10,
-        state_dir: dir.to_path_buf(),
-    };
-    let key = key.clone();
-    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let thread = thread::Builder::new()
-        .name("test-air-listener".into())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(air_listener::run(&settings, &key, &serve, async move {
-                let _ = stopped.await;
-            }))
-        })
-        .unwrap();
-    Listener {
-        stop: Some(stop),
-        thread: Some(thread),
-    }
-}
-
-impl Drop for Listener {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
 /// The ESP mint as fsp-mint reaches it: its DID and the AIR server (what the
-/// `air.*` settings name), its listener (which a test may stop and start again,
-/// as an ESP mint that is down and comes back), and its HTTP base, which only
-/// the tests read (`/audit`).
+/// `air.esp_*` settings name), its listener (which a test may stop and start
+/// again, as an ESP mint that is down and comes back), and its HTTP base, which
+/// only the tests read (`/audit`).
 struct EspAt {
     url: String,
     did: ServiceDid,
@@ -173,14 +119,14 @@ struct EspAt {
 
 impl EspAt {
     /// What `esp-mint serve` hands its listener to answer with.
-    fn serve(&self) -> Arc<Serve> {
+    fn serve(&self) -> Arc<esp_mint::air_listener::Serve> {
         let state = Arc::clone(&self.state);
         Arc::new(move |kind: u8, body: &[u8]| esp_mint::server::air_served(&state, kind, body))
     }
 
     /// Start the listener (the ESP mint is answering).
     fn listen(&self) {
-        let listener = start_serving(&self.server, &self.key, &self.data, self.serve());
+        let listener = start_esp_listening(&self.server, &self.key, &self.data, self.serve());
         *self.listener.lock().unwrap() = Some(listener);
     }
 
@@ -194,7 +140,7 @@ impl EspAt {
     fn wait_for_next(&self, want: u32) {
         let until = Instant::now() + Duration::from_secs(15);
         loop {
-            let now = air_listener::read_next(&self.data).unwrap();
+            let now = esp_mint::air_listener::read_next(&self.data).unwrap();
             if now == want {
                 return;
             }
@@ -206,10 +152,14 @@ impl EspAt {
         }
     }
 
-    /// The `air.*` settings that point fsp-mint at this ESP mint.
+    /// The `air.esp_*` settings that point fsp-mint at this ESP mint (and the
+    /// listener's own `air.server` and `air.host`, which are the same AIR server
+    /// here: the DIDs differ, so the mailboxes do).
     fn settings(&self, wait_secs: &str, attempts: &str) -> Vec<(&'static str, String)> {
         vec![
             ("air.esp_did", self.did.to_hex()),
+            ("air.esp_server", self.server.name.clone()),
+            ("air.esp_host", self.server.host.clone()),
             ("air.server", self.server.name.clone()),
             ("air.host", self.server.host.clone()),
             ("air.reply_wait_secs", wait_secs.to_string()),
@@ -239,7 +189,7 @@ fn start_esp(rt: &Runtime, dir: &Path) -> (EspAt, Arc<EspState>) {
     });
     let key = DidKey::new();
     let at = EspAt {
-        url: serve(rt, esp_mint::server::router(Arc::clone(&state))),
+        url: serve_http(rt, esp_mint::server::router(Arc::clone(&state))),
         did: addr::key_to_did(&key.public_key()),
         key,
         state: Arc::clone(&state),
@@ -363,9 +313,28 @@ fn spend_request(
 }
 
 struct Fsp {
-    url: String,
+    /// fsp-mint's AIR listener. First, so that it stops before the rest goes.
+    _listener: Listener,
+    /// The app side: asks the service's DID over AIR.
+    air: Air,
+    /// The HTTP base of what is left: `/audit`.
+    http: String,
     state: Arc<FspState>,
     clock: Arc<AtomicU64>,
+}
+
+impl Fsp {
+    /// `POST route` over AIR: the status and JSON of the outcome.
+    fn post(&self, route: &str, body: &impl serde::Serialize) -> (u16, serde_json::Value) {
+        self.air.post_json(route, body)
+    }
+
+    /// `GET route` over AIR, which must be answered; its JSON as a `T`.
+    fn get_as<T: serde::de::DeserializeOwned>(&self, route: &str) -> T {
+        let (status, body) = self.air.get_json(route);
+        assert_eq!(status, 200, "{route}: {body}");
+        serde_json::from_value(body).unwrap()
+    }
 }
 
 fn start_fsp(rt: &Runtime, dir: &Path, esp: &EspAt, activation: &str) -> Fsp {
@@ -382,6 +351,19 @@ fn start_fsp_waiting(
     wait_secs: &str,
     attempts: &str,
 ) -> Fsp {
+    start_fsp_with(rt, dir, esp, activation, wait_secs, attempts, &[])
+}
+
+/// [`start_fsp_waiting`] with more settings (`extra`, applied last).
+fn start_fsp_with(
+    rt: &Runtime,
+    dir: &Path,
+    esp: &EspAt,
+    activation: &str,
+    wait_secs: &str,
+    attempts: &str,
+    extra: &[(&str, &str)],
+) -> Fsp {
     let mut cfg = Config::default();
     for (key, value) in esp.settings(wait_secs, attempts) {
         cfg.set(key, &value).unwrap();
@@ -389,10 +371,14 @@ fn start_fsp_waiting(
     cfg.set("service.did", &service().to_string()).unwrap();
     cfg.set("rotation.activation_hours", activation).unwrap();
     cfg.set("rotation.period_hours", "240").unwrap();
+    for (key, value) in extra {
+        cfg.set(key, value).unwrap();
+    }
     // The mint first issued at NOW (the record a real first issue writes).
     std::fs::create_dir_all(dir.join("fsp")).unwrap();
     fsp_mint::keysets::record_first_issue(&dir.join("fsp"), NOW).unwrap();
     cfg.validate().unwrap();
+    cfg.require_air().unwrap();
     let clock = Arc::new(AtomicU64::new(NOW));
     let spender = Spender::open(&dir.join("fsp"), cfg.rotation(), 1024, NOW).unwrap_or_else(|_| {
         std::fs::create_dir_all(dir.join("fsp")).unwrap();
@@ -409,21 +395,25 @@ fn start_fsp_waiting(
         service_keypair: Some(service_keypair()),
         clock: Box::new(move || c.load(Ordering::SeqCst)),
     });
+    // The listener `serve` starts: the service's own key, the network's data
+    // folder for the slot counter, and the settings' AIR server.
+    let key = service_air_key();
+    let did = addr::key_to_did(&key.public_key());
+    assert!(did == service(), "the AIR key is the service's DID key");
+    let answering = Arc::clone(&state);
+    let listener = start_listening(
+        &esp.server,
+        &key,
+        &dir.join("fsp"),
+        Arc::new(move |kind: u8, body: &[u8]| server::air_served(&answering, kind, body)),
+    );
     Fsp {
-        url: serve(rt, server::router(Arc::clone(&state))),
+        _listener: listener,
+        air: Air::new(&esp.server, did, "main"),
+        http: serve_http(rt, server::router(Arc::clone(&state))),
         state,
         clock,
     }
-}
-
-fn post(url: &str, body: &impl serde::Serialize) -> (u16, serde_json::Value) {
-    let r = reqwest::blocking::Client::new()
-        .post(url)
-        .json(body)
-        .send()
-        .unwrap();
-    let s = r.status().as_u16();
-    (s, r.json().unwrap_or_default())
 }
 
 fn current(f: &Fsp) -> Arc<Keyset> {
@@ -466,7 +456,7 @@ fn issue_mixed_days_keeps_the_esp_and_never_issues_twice() {
             },
         ],
     };
-    let (status, body) = post(&format!("{}/issue", f.url), &req);
+    let (status, body) = f.post("/issue", &req);
     assert_eq!(status, 200, "{body}");
     let reply: IssueResponse = serde_json::from_value(body.clone()).unwrap();
     assert!(
@@ -477,7 +467,7 @@ fn issue_mixed_days_keeps_the_esp_and_never_issues_twice() {
         "{body}"
     );
     // The same request again: the stored answer, nothing issued twice.
-    let (status2, body2) = post(&format!("{}/issue", f.url), &req);
+    let (status2, body2) = f.post("/issue", &req);
     assert_eq!((status2, &body2), (200, &body));
     assert_eq!(
         f.state.issues.lock().unwrap().data.kept.len(),
@@ -500,7 +490,7 @@ fn issue_mixed_days_keeps_the_esp_and_never_issues_twice() {
     let mut again = req.clone();
     again.groups[0].outputs = vec![Out::new(4).mint(), Out::new(1).mint()];
     again.groups[1].outputs = vec![Out::new(8).mint()];
-    let (s3, b3) = post(&format!("{}/issue", f.url), &again);
+    let (s3, b3) = f.post("/issue", &again);
     assert_eq!(
         (s3, b3["code"].as_str()),
         (400, Some("already_spent")),
@@ -534,32 +524,26 @@ fn issue_mixed_days_keeps_the_esp_and_never_issues_twice() {
     notes.push((n8, s8k, 8));
     let change = Out::new(4);
     let spend = spend_request(keyset, &notes, &[change.mint()], 9);
-    let (s, body) = post(&format!("{}/spend", f.url), &spend);
+    let (s, body) = f.post("/spend", &spend);
     assert_eq!(s, 200, "{body}");
     assert_eq!(body["paid"], 9);
-    let (s, body_again) = post(&format!("{}/spend", f.url), &spend);
+    let (s, body_again) = f.post("/spend", &spend);
     assert_eq!(
         (s, &body_again),
         (200, &body),
         "a retry gets the stored answer"
     );
     let other = spend_request(keyset, &notes, &[Out::new(4).mint()], 9);
-    let (s, b) = post(&format!("{}/spend", f.url), &other);
+    let (s, b) = f.post("/spend", &other);
     assert_eq!((s, b["code"].as_str()), (400, Some("already_spent")), "{b}");
 
     // Wrong service and not exact are refused before anything.
     let mut wrong = req.clone();
     wrong.service = ServiceDid::from(Keypair::new(SECP256K1, &mut OsRng).public_key());
-    assert_eq!(
-        post(&format!("{}/issue", f.url), &wrong).1["code"],
-        "wrong_service"
-    );
+    assert_eq!(f.post("/issue", &wrong).1["code"], "wrong_service");
     let mut inexact = req.clone();
     inexact.groups[1].outputs = vec![Out::new(4).mint()];
-    assert_eq!(
-        post(&format!("{}/issue", f.url), &inexact).1["code"],
-        "not_exact"
-    );
+    assert_eq!(f.post("/issue", &inexact).1["code"], "not_exact");
 }
 
 /// The refused transfer over AIR: the ESP mint's signed `400` refusal for one
@@ -588,7 +572,7 @@ fn an_esp_note_for_another_service_or_day_is_refused_by_the_issuer_for_its_group
             },
         ],
     };
-    let (s, body) = post(&format!("{}/issue", f.url), &req);
+    let (s, body) = f.post("/issue", &req);
     assert_eq!(s, 200, "{body}");
     assert_eq!(body["groups"][0]["result"], "issued");
     assert_eq!(body["groups"][1]["result"], "refused");
@@ -603,26 +587,17 @@ fn rotation_keeps_previous_notes_for_one_period_then_they_are_lost() {
     // Activation 120 hours after the first issue (NOW), period 240 hours.
     let f = start_fsp(&rt, &dir, &esp_at, "120");
     let genesis = current(&f);
-    let before: RotationResponse = reqwest::blocking::get(format!("{}/rotation", f.url))
-        .unwrap()
-        .json()
-        .unwrap();
+    let before: RotationResponse = f.get_as("/rotation");
     assert!(!before.active && before.previous.is_none());
     assert_eq!(before.current.current_until, Some(NOW + 5 * 86_400));
     let (n, s) = fsp_note(&genesis, 16);
     let (n2, s2) = fsp_note(&genesis, 16);
     f.clock.store(NOW + 5 * 86_400, Ordering::SeqCst);
-    let keys: KeysResponse = reqwest::blocking::get(format!("{}/keys", f.url))
-        .unwrap()
-        .json()
-        .unwrap();
+    let keys: KeysResponse = f.get_as("/keys");
     assert_eq!(keys.previous.as_deref(), Some(genesis.id.as_str()));
     assert_ne!(keys.current, genesis.id);
     assert_eq!(keys.next_rotation, Some(NOW + 15 * 86_400));
-    let w: RotationResponse = reqwest::blocking::get(format!("{}/rotation", f.url))
-        .unwrap()
-        .json()
-        .unwrap();
+    let w: RotationResponse = f.get_as("/rotation");
     assert!(w.active);
     assert_eq!(w.rotation_period_hours, 240);
     assert_eq!(
@@ -640,16 +615,16 @@ fn rotation_keeps_previous_notes_for_one_period_then_they_are_lost() {
     assert_eq!(w.next_rotation, Some(NOW + 15 * 86_400));
     // A previous-set note swaps to the current set.
     let o = Out::new(16);
-    let (st, body) = post(
-        &format!("{}/spend", f.url),
+    let (st, body) = f.post(
+        "/spend",
         &spend_request(&genesis.id, &[(n, s, 16)], &[o.mint()], 0),
     );
     assert_eq!(st, 200, "{body}");
     assert_eq!(body["keyset"], keys.current.as_str());
     // A full period later the genesis set is gone with its spent list.
     f.clock.store(NOW + 15 * 86_400, Ordering::SeqCst);
-    let (st, body) = post(
-        &format!("{}/spend", f.url),
+    let (st, body) = f.post(
+        "/spend",
         &spend_request(&genesis.id, &[(n2, s2, 16)], &[Out::new(16).mint()], 0),
     );
     assert_eq!(
@@ -766,10 +741,7 @@ fn the_spend_limit_is_the_setting_and_is_served_on_fees() {
     let dir = scratch("feeitems");
     let (esp_at, _esp) = start_esp(&rt, &dir);
     let f = start_fsp(&rt, &dir, &esp_at, "0");
-    let fees: FeesResponse = reqwest::blocking::get(format!("{}/fees", f.url))
-        .unwrap()
-        .json()
-        .unwrap();
+    let fees: FeesResponse = f.get_as("/fees");
     assert_eq!(fees.issue_max_items, Some(1000));
     assert_eq!(fees.spend_max_items, Some(1000));
     assert_eq!(fees.spend_max_memo_bytes, Some(256));
@@ -845,34 +817,41 @@ fn throughput_of_the_spend_path() {
     assert!(rate > 300.0, "{rate:.0} spends a second");
 }
 
+/// The ceiling is the setting (`server.max_request_bytes`, 4096 at the least):
+/// over it a call is refused before it is parsed, with the `413` JSON the HTTP
+/// route had and the `http_status` a refusal carries over AIR; at it the body is
+/// read, and is not a request, so a `400`.
 #[test]
 fn a_body_over_the_ceiling_is_refused_before_parsing() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("limit");
     let (esp_at, _esp) = start_esp(&rt, &dir);
-    let f = start_fsp(&rt, &dir, &esp_at, "0");
-    let big = vec![b' '; 2 * 1024 * 1024];
-    for route in ["issue", "spend"] {
-        // A raw request: the mint answers from the header alone and may close
-        // before the body is sent, so a write error is not a failure here.
-        use std::io::{Read, Write};
-        let addr = f.url.trim_start_matches("http://");
-        let mut c = std::net::TcpStream::connect(addr).unwrap();
-        let head = format!(
-            "POST /{route} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            big.len()
-        );
-        c.write_all(head.as_bytes()).unwrap();
-        let _ = c.write_all(&big);
-        let mut reply = String::new();
-        let _ = c.read_to_string(&mut reply);
-        assert!(reply.starts_with("HTTP/1.1 413"), "{reply}");
-        assert!(reply.contains("request_too_large"), "{reply}");
+    let f = start_fsp_with(
+        &rt,
+        &dir,
+        &esp_at,
+        "0",
+        "20",
+        "2",
+        &[("server.max_request_bytes", "4096")],
+    );
+    for route in ["/issue", "/spend"] {
+        // One byte over: refused for its size, not for its content.
+        let big = vec![b' '; 4097];
+        let (status, body) = f.air.call(route, &big);
+        assert_eq!(status, 413, "{route}: {body}");
+        assert_eq!(body["code"], "request_too_large", "{route}");
+        assert_eq!(body["limit_bytes"], 4096, "{route}");
+        assert_eq!(body["size_bytes"], 4097, "{route}");
+        // At the limit the body is read and is not a request.
+        let at = vec![b' '; 4096];
+        let (status, body) = f.air.call(route, &at);
+        assert_eq!(status, 400, "{route}: {body}");
+        assert_eq!(body["code"], "malformed_request", "{route}");
     }
-    let w: RotationResponse = reqwest::blocking::get(format!("{}/rotation", f.url))
-        .unwrap()
-        .json()
-        .unwrap();
+    // Nothing was issued or spent by any of it.
+    assert_eq!(f.state.issues.lock().unwrap().data.kept.len(), 0);
+    let w: RotationResponse = f.get_as("/rotation");
     assert!(
         !w.active
             && w.activation.is_none()
@@ -881,13 +860,97 @@ fn a_body_over_the_ceiling_is_refused_before_parsing() {
             && w.current.retires.is_none()
     );
     assert_eq!(w.rotation_period_hours, 240);
-    let h: serde_json::Value = reqwest::blocking::get(format!("{}/health", f.url))
-        .unwrap()
-        .json()
-        .unwrap();
+    // The mint info is the health JSON.
+    let h: serde_json::Value = f.get_as("/health");
+    assert_eq!(h["status"], "ok");
     assert_eq!(h["network"], "main");
     // The wire format this mint speaks; a wallet refuses a mint on another number.
     assert_eq!(h["wire_version"], sp_wire::WIRE_VERSION);
+}
+
+/// A refused spend is a signed refusal with the route's JSON (a `400`, no
+/// `http_status`), and nothing is spent by it.
+#[test]
+fn a_refused_spend_is_a_signed_refusal_with_the_routes_json() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("refused-spend");
+    let (esp_at, _esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_at, "0");
+    let k = current(&f);
+    let (n, s) = fsp_note(&k, 4);
+    // No notes: refused before anything else.
+    let none = spend_request(&k.id, &[], &[Out::new(1).mint()], 1);
+    let (status, body) = f.post("/spend", &none);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("no_inputs")),
+        "{body}"
+    );
+    assert!(
+        body.get("http_status").is_none(),
+        "a 400 has the route's JSON as it is"
+    );
+    // A memo over the setting (256 bytes): refused, the note is not spent.
+    let mut long = spend_request(&k.id, &[(n, s, 4)], &[Out::new(1).mint()], 3);
+    long.memo = "x".repeat(300);
+    let (status, body) = f.post("/spend", &long);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("memo_too_long")),
+        "{body}"
+    );
+    assert!(!f.state.spender.is_spent(&k.id, &n.nonce.0.serialize()));
+    // A note the mint never signed: refused, and still not spent.
+    let other_keys = fsp_mint::keysets::Keysets::open(&scratch("other-keys")).unwrap();
+    let (forged, fs) = fsp_note(other_keys.current(), 4);
+    let (status, body) = f.post(
+        "/spend",
+        &spend_request(&k.id, &[(forged, fs, 4)], &[Out::new(1).mint()], 3),
+    );
+    assert!((400..500).contains(&status), "{status}: {body}");
+    assert!(body["code"].is_string(), "{body}");
+    assert!(!f.state.spender.is_spent(&k.id, &forged.nonce.0.serialize()));
+}
+
+/// Over HTTP only `/audit` and `/health` answer (the operator's report and the
+/// local health monitor's check): the routes wallets used (they use AIR) are gone,
+/// and both are read-only.
+#[test]
+fn only_the_audit_and_the_health_check_answer_over_http() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("http-left");
+    let (esp_at, _esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_at, "0");
+    let http = reqwest::blocking::Client::new();
+    for route in ["keys", "fees", "rotation"] {
+        let r = http.get(format!("{}/{route}", f.http)).send().unwrap();
+        assert_eq!(r.status().as_u16(), 404, "GET /{route}");
+    }
+    for route in ["issue", "spend"] {
+        let r = http
+            .post(format!("{}/{route}", f.http))
+            .body("{}")
+            .send()
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 404, "POST /{route}");
+    }
+    let r = http.get(format!("{}/health", f.http)).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let h: serde_json::Value = r.json().unwrap();
+    assert_eq!(h["status"], "ok");
+    assert_eq!(h["wire_version"], sp_wire::WIRE_VERSION);
+    let r = http.post(format!("{}/health", f.http)).send().unwrap();
+    assert_eq!(r.status().as_u16(), 405, "/health reads only");
+    let r = http.get(format!("{}/audit", f.http)).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let report: Report = r.json().unwrap();
+    assert!(
+        report.complete && report.consistent,
+        "{:?}",
+        report.warnings
+    );
+    let r = http.post(format!("{}/audit", f.http)).send().unwrap();
+    assert_eq!(r.status().as_u16(), 405, "/audit reads only");
 }
 
 #[test]
@@ -950,15 +1013,12 @@ fn outputs_prepared_before_a_rotation_are_signed_by_the_new_set_and_the_reply_sa
     f.clock.store(NOW + 5 * 86_400, Ordering::SeqCst);
     let now_set = current(&f);
     assert_ne!(now_set.id, genesis.id);
-    let keys: KeysResponse = reqwest::blocking::get(format!("{}/keys", f.url))
-        .unwrap()
-        .json()
-        .unwrap();
+    let keys: KeysResponse = f.get_as("/keys");
 
     // Spend: signed by the current set, named in the reply, and the note
     // unblinds with that set's published key.
-    let (st, body) = post(
-        &format!("{}/spend", f.url),
+    let (st, body) = f.post(
+        "/spend",
         &spend_request(&genesis.id, &[(n, s, 16)], &[spend_out.mint()], 0),
     );
     assert_eq!(st, 200, "{body}");
@@ -974,7 +1034,7 @@ fn outputs_prepared_before_a_rotation_are_signed_by_the_new_set_and_the_reply_sa
     ));
 
     // Issue: the same.
-    let (st, body) = post(&format!("{}/issue", f.url), &req);
+    let (st, body) = f.post("/issue", &req);
     assert_eq!(st, 200, "{body}");
     let issued: IssueResponse = serde_json::from_value(body.clone()).unwrap();
     let GroupResult::Issued {
@@ -1004,7 +1064,7 @@ fn outputs_prepared_before_a_rotation_are_signed_by_the_new_set_and_the_reply_sa
     // still names the set that signed it.
     f.clock.store(NOW + 15 * 86_400, Ordering::SeqCst);
     assert_ne!(current(&f).id, now_set.id);
-    let (st, again) = post(&format!("{}/issue", f.url), &req);
+    let (st, again) = f.post("/issue", &req);
     assert_eq!((st, &again), (200, &body));
 }
 
@@ -1021,7 +1081,7 @@ fn issue_one(esp: &EspState, f: &Fsp, units: u64, day: u64) -> (Note, SecretKey,
             outputs: vec![out.mint()],
         }],
     };
-    let (s, body) = post(&format!("{}/issue", f.url), &req);
+    let (s, body) = f.post("/issue", &req);
     assert_eq!(s, 200, "{body}");
     let reply: IssueResponse = serde_json::from_value(body).unwrap();
     let GroupResult::Issued {
@@ -1038,7 +1098,7 @@ fn issue_one(esp: &EspState, f: &Fsp, units: u64, day: u64) -> (Note, SecretKey,
 }
 
 fn get_audit(f: &Fsp) -> Report {
-    reqwest::blocking::get(format!("{}/audit", f.url))
+    reqwest::blocking::get(format!("{}/audit", f.http))
         .unwrap()
         .json()
         .unwrap()
@@ -1090,9 +1150,9 @@ fn the_audit_counts_issue_spend_and_change_and_the_esp_reserve() {
             },
         ],
     };
-    let (s, body) = post(&format!("{}/issue", f.url), &req);
+    let (s, body) = f.post("/issue", &req);
     assert_eq!(s, 200, "{body}");
-    let (s, again) = post(&format!("{}/issue", f.url), &req);
+    let (s, again) = f.post("/issue", &req);
     assert_eq!((s, &again), (200, &body), "a retry is the stored answer");
     let reply: IssueResponse = serde_json::from_value(body).unwrap();
 
@@ -1135,7 +1195,7 @@ fn the_audit_counts_issue_spend_and_change_and_the_esp_reserve() {
         }
     }
     let spend = spend_request(&ks, &notes, &[Out::new(4).mint()], 9);
-    assert_eq!(post(&format!("{}/spend", f.url), &spend).0, 200);
+    assert_eq!(f.post("/spend", &spend).0, 200);
     let r = get_audit(&f);
     let l = line(&r, &ks);
     assert_eq!(
@@ -1150,9 +1210,9 @@ fn the_audit_counts_issue_spend_and_change_and_the_esp_reserve() {
     assert_eq!((units(&r.fsp.outstanding), units(&r.fsp.paid)), (4, 9));
 
     // The same spend again, and the same notes in another spend: no change.
-    assert_eq!(post(&format!("{}/spend", f.url), &spend).0, 200);
+    assert_eq!(f.post("/spend", &spend).0, 200);
     let other = spend_request(&ks, &notes, &[Out::new(4).mint()], 9);
-    assert_eq!(post(&format!("{}/spend", f.url), &other).0, 400);
+    assert_eq!(f.post("/spend", &other).0, 400);
     assert_eq!(get_audit(&f).fsp, r.fsp);
 
     // The ESP does not change with spends: it is the reserve for them.
@@ -1187,8 +1247,8 @@ fn the_audit_follows_rotation_expiry_and_a_restart() {
     f.clock
         .store(NOW + 5 * 86_400, std::sync::atomic::Ordering::SeqCst);
     let out16 = Out::new(16);
-    let (st, body) = post(
-        &format!("{}/spend", f.url),
+    let (st, body) = f.post(
+        "/spend",
         &spend_request(&g, &[(a, a_key, 16)], &[out16.mint()], 0),
     );
     assert_eq!(st, 200, "{body}");
@@ -1214,8 +1274,8 @@ fn the_audit_follows_rotation_expiry_and_a_restart() {
 
     // Pay 6 out of the swapped 16, 10 as change.
     let (n16, k16) = out16.note(&first.signatures[0], &first.keys[0]);
-    let (st, _) = post(
-        &format!("{}/spend", f.url),
+    let (st, _) = f.post(
+        "/spend",
         &spend_request(
             &c,
             &[(n16, k16, 16)],
@@ -1438,7 +1498,7 @@ fn an_esp_mint_that_does_not_answer_leaves_the_issue_pending_and_the_retry_finis
 
     // A first issue: the keyset read is slot 0, its transfer slot 1.
     let first = one_group(&esp, 2, day);
-    let (s, body) = post(&format!("{}/issue", f.url), &first);
+    let (s, body) = f.post("/issue", &first);
     assert_eq!(s, 200, "{body}");
     esp_at.wait_for_next(2);
 
@@ -1447,9 +1507,10 @@ fn an_esp_mint_that_does_not_answer_leaves_the_issue_pending_and_the_retry_finis
     esp_at.silence();
     let second = one_group(&esp, 4, day);
     let hash = second.hash();
-    let (s, body) = post(&format!("{}/issue", f.url), &second);
-    assert_eq!(s, 502, "{body}");
-    assert_eq!(body["code"], "issuer_unavailable", "{body}");
+    let (s, body) = f.post("/issue", &second);
+    // A signed "cannot answer now": the 502 of the HTTP route, a 5xx, so the
+    // wallet keeps the issue pending and its retry gets the stored answer.
+    assert_eq!(s, 503, "{body}");
     assert_eq!(f.state.issues.lock().unwrap().data.kept.len(), 1);
     // The request in flight is kept in `issues.json`, beside its transfer.
     let file = issues_file(&dir);
@@ -1467,7 +1528,7 @@ fn an_esp_mint_that_does_not_answer_leaves_the_issue_pending_and_the_retry_finis
     // request, finds the answer, and writes nothing.
     drop(f);
     let f = start_fsp(&rt, &dir, &esp_at, "0");
-    let (s, body) = post(&format!("{}/issue", f.url), &second);
+    let (s, body) = f.post("/issue", &second);
     assert_eq!(s, 200, "{body}");
     assert_eq!(body["groups"][0]["result"], "issued", "{body}");
     assert_eq!(f.state.issues.lock().unwrap().data.kept.len(), 2);
@@ -1526,6 +1587,20 @@ fn fsp_run(base: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Ou
     }
 }
 
+/// The five AIR settings of `serve` as environment: the ESP mint's (DID, AIR
+/// server, host) and this mint's own listener's (AIR server, host).
+fn air_env<'a>(esp_at: &'a EspAt, did: &'a str) -> Vec<(&'a str, &'a str)> {
+    vec![
+        ("FSP_AIR_ESP_DID", did),
+        ("FSP_AIR_ESP_SERVER", esp_at.server.name.as_str()),
+        ("FSP_AIR_ESP_HOST", esp_at.server.host.as_str()),
+        ("FSP_AIR_SERVER", esp_at.server.name.as_str()),
+        ("FSP_AIR_HOST", esp_at.server.host.as_str()),
+        ("FSP_AIR_REPLY_WAIT_SECS", "20"),
+        ("FSP_AIR_ATTEMPTS", "2"),
+    ]
+}
+
 #[test]
 fn serve_refuses_to_start_when_the_esp_mint_is_on_another_network() {
     let rt = Runtime::new().unwrap();
@@ -1533,14 +1608,8 @@ fn serve_refuses_to_start_when_the_esp_mint_is_on_another_network() {
     let (esp_at, _esp) = start_esp(&rt, &dir); // reports "main"
     let base = scratch("mismatch-run");
     let did = esp_at.did.to_hex();
-    let air = [
-        ("FSP_NETWORK", "regtest"),
-        ("FSP_AIR_ESP_DID", did.as_str()),
-        ("FSP_AIR_SERVER", esp_at.server.name.as_str()),
-        ("FSP_AIR_HOST", esp_at.server.host.as_str()),
-        ("FSP_AIR_REPLY_WAIT_SECS", "20"),
-        ("FSP_AIR_ATTEMPTS", "2"),
-    ];
+    let mut air = air_env(&esp_at, &did);
+    air.push(("FSP_NETWORK", "regtest"));
     // The service key first, so that serve gets as far as the network check.
     let made = fsp_run(&base, &["service-key"], &air);
     let text = String::from_utf8_lossy(&made.stdout).to_string();
@@ -1566,22 +1635,32 @@ fn serve_refuses_to_start_when_the_esp_mint_is_on_another_network() {
 #[test]
 fn serve_refuses_to_start_without_the_air_settings_and_names_each_missing_one() {
     let base = scratch("no-air");
-    // None of the three.
+    // None of the five.
     let out = fsp_run(&base, &["serve"], &[]);
     let err = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(!out.status.success(), "serve started");
-    for missing in ["air.esp_did", "air.server", "air.host"] {
+    for missing in [
+        "air.esp_did",
+        "air.esp_server",
+        "air.esp_host",
+        "air.server",
+        "air.host",
+    ] {
         assert!(err.contains(missing), "{missing} is not named: {err}");
     }
-    // Only the host set: the other two are named, the host is not.
-    let out = fsp_run(&base, &["serve"], &[("FSP_AIR_HOST", "127.0.0.1")]);
+    // Only the ESP host set: the other four are named, that one is not.
+    let out = fsp_run(&base, &["serve"], &[("FSP_AIR_ESP_HOST", "127.0.0.1")]);
     let err = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(!out.status.success(), "serve started");
-    assert!(
-        err.contains("air.esp_did") && err.contains("air.server"),
-        "{err}"
-    );
-    assert!(!err.contains("FSP_AIR_HOST"), "{err}");
+    for missing in [
+        "(FSP_AIR_ESP_DID)",
+        "(FSP_AIR_ESP_SERVER)",
+        "(FSP_AIR_SERVER)",
+        "(FSP_AIR_HOST)",
+    ] {
+        assert!(err.contains(missing), "{missing} is not named: {err}");
+    }
+    assert!(!err.contains("(FSP_AIR_ESP_HOST)"), "{err}");
     // The old settings are gone, with a message that says what replaces them.
     let out = fsp_run(
         &base,
@@ -1592,4 +1671,46 @@ fn serve_refuses_to_start_without_the_air_settings_and_names_each_missing_one() 
     assert!(!out.status.success(), "config accepted esp.url");
     assert!(err.contains("esp.url") && err.contains("is gone"), "{err}");
     assert!(err.contains("air.esp_did"), "{err}");
+}
+
+/// The listener always runs, so `serve` needs its settings even when the ESP
+/// mint's are all there: it names the two that are missing, and only those.
+#[test]
+fn serve_refuses_to_start_without_its_own_listener_settings() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("no-listener");
+    let (esp_at, _esp) = start_esp(&rt, &dir);
+    let base = scratch("no-listener-run");
+    let did = esp_at.did.to_hex();
+    let env: Vec<(&str, &str)> = air_env(&esp_at, &did)
+        .into_iter()
+        .filter(|(k, _)| *k != "FSP_AIR_SERVER" && *k != "FSP_AIR_HOST")
+        .collect();
+    let out = fsp_run(&base, &["serve"], &env);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "serve started: {err}");
+    assert!(
+        err.contains("air.server (FSP_AIR_SERVER)") && err.contains("air.host (FSP_AIR_HOST)"),
+        "{err}"
+    );
+    for set in [
+        "(FSP_AIR_ESP_DID)",
+        "(FSP_AIR_ESP_SERVER)",
+        "(FSP_AIR_ESP_HOST)",
+    ] {
+        assert!(!err.contains(set), "{set} is set and is named: {err}");
+    }
+}
+
+/// What is left on `server.bind` is for the operator on this machine.
+#[test]
+fn serve_refuses_a_bind_that_is_not_loopback() {
+    let base = scratch("bind");
+    let out = fsp_run(&base, &["serve"], &[("FSP_BIND", "0.0.0.0:3200")]);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "serve started: {err}");
+    assert!(
+        err.contains("server.bind") && err.contains("not a loopback address"),
+        "{err}"
+    );
 }

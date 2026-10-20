@@ -1,4 +1,4 @@
-//! `POST /spend`, the fast path: a swap with change.
+//! The spend call (over AIR, kind 12), the fast path: a swap with change.
 //!
 //! **Spent lists.** One per live keyset, held in memory (`HashSet` of note
 //! nonces). Each spend is also one JSON line in the log of the keyset that was

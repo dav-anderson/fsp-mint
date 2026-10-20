@@ -5,12 +5,15 @@
 //! - [`api`]: the request and reply types (the wallet uses them too).
 //! - [`keysets`]: the FSP signing keys, their rotation, and the key file.
 //! - [`store`]: atomic JSON files.
-//! - [`issue`]: `POST /issue`, ESP in (transferred at the Issuer and kept), FSP out.
-//! - [`spend`]: `POST /spend`, the fast path, with the spent lists and their log.
+//! - [`issue`]: the issue call (kind 11), ESP in (transferred at the Issuer and kept), FSP out.
+//! - [`spend`]: the spend call (kind 12), the fast path, with the spent lists and their log.
 //! - [`esp_client`]: the calls to the ESP mint (the Issuer) and what they return.
 //! - [`esp_air`]: those calls over AIR, the only way this mint reaches the ESP mint.
-//! - [`server`]: the HTTP routes.
+//! - [`server`]: what the mint answers (an outcome function per call) and the one
+//!   HTTP route left, `GET /audit`.
+//! - [`air_listener`]: this mint's own AIR listener, the only way wallets reach it.
 
+pub mod air_listener;
 pub mod api;
 pub mod audit;
 pub mod config;
