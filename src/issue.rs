@@ -41,7 +41,7 @@ use sp_wire::esp::transfer::{self, TransferRequest};
 
 use crate::api::{GroupResult, IssueRequest, IssueResponse, issue_group_size};
 use crate::audit::Num;
-use crate::esp_client::{Issuer, TransferOutcome};
+use crate::esp_client::{AirRequest, Issuer, TransferOutcome};
 use crate::keysets::Keyset;
 use crate::store;
 
@@ -101,6 +101,14 @@ pub struct PendingGroup {
     pub transfer: TransferRequest,
     pub esp_outputs: Vec<EspOut>,
     pub state: GroupState,
+    /// The request to the Issuer over AIR that carries `transfer` and has not
+    /// been answered, kept here beside the transfer so that a retry reads the
+    /// reply cell of the same request first and writes no second one. Absent
+    /// when no request is in flight, and in files written before 0.6.0 (they
+    /// read as none: the retry then makes a new request, which the Issuer
+    /// answers from its stored answer if it did the transfer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub air: Option<AirRequest>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -373,7 +381,32 @@ fn build_transfer(
         },
         esp_outputs,
         state: GroupState::Waiting,
+        air: None,
     }
+}
+
+/// Send the transfer of group `g` to the Issuer, keeping the request in flight
+/// in the pending group (and `issues.json`) before it is written and after each
+/// write, and clearing it when the request ended.
+fn send_transfer(
+    issues: &mut Issues,
+    issuer: &dyn Issuer,
+    pending: &mut Pending,
+    hash: &str,
+    g: usize,
+) -> TransferOutcome {
+    let transfer = pending.groups[g].transfer.clone();
+    let kept = pending.groups[g].air.clone();
+    let (outcome, kept) = issuer.transfer_kept(&transfer, kept, &mut |k: &AirRequest| {
+        pending.groups[g].air = Some(k.clone());
+        issues
+            .data
+            .entries
+            .insert(hash.to_string(), Entry::Pending(Box::new(pending.clone())));
+        issues.save().map_err(|e| e.to_string())
+    });
+    pending.groups[g].air = kept;
+    outcome
 }
 
 /// Run one issue request to the end, or as far as the Issuer allows.
@@ -456,7 +489,7 @@ pub fn issue(
         if !matches!(pending.groups[g].state, GroupState::Waiting) {
             continue;
         }
-        let mut outcome = issuer.transfer(&pending.groups[g].transfer);
+        let mut outcome = send_transfer(issues, issuer, &mut pending, &hash, g);
         // The cached keyset was deleted at the Issuer (it signs with any live
         // set, so a set that has only been rotated to previous still works):
         // drop it, read the current one, re-blind the group's ESP outputs for
@@ -473,7 +506,7 @@ pub fn issue(
                             .entries
                             .insert(hash.clone(), Entry::Pending(Box::new(pending.clone())));
                         issues.save().map_err(internal)?;
-                        outcome = issuer.transfer(&pending.groups[g].transfer);
+                        outcome = send_transfer(issues, issuer, &mut pending, &hash, g);
                     }
                 }
             }
@@ -521,6 +554,12 @@ pub fn issue(
                 pending.groups[g].state = GroupState::Refused { why }
             }
             TransferOutcome::Unknown(why) => {
+                // Keep the request still in flight, for the retry.
+                issues
+                    .data
+                    .entries
+                    .insert(hash.clone(), Entry::Pending(Box::new(pending.clone())));
+                issues.save().map_err(internal)?;
                 return Err(IssueError {
                     status: 502,
                     code: sp_wire::codes::ISSUER_UNAVAILABLE,
@@ -1002,5 +1041,115 @@ mod tests {
         );
         assert_ne!(x.hash(), spend(&["aa", "c"]).hash());
         assert_eq!(x.hash(), spend(&["aa", "b"]).hash());
+    }
+    /// An Issuer stand-in that keeps a request the way the AIR one does: the
+    /// first call saves one and gets no answer, and the retry must be handed it
+    /// back; then it answers and the request is over.
+    struct Keeping {
+        seen: Mutex<Vec<Option<AirRequest>>>,
+    }
+
+    fn in_flight() -> AirRequest {
+        AirRequest {
+            request_id: "ab".repeat(32),
+            mint: "02".repeat(33),
+            r: "cd".repeat(32),
+            slots: vec![4],
+            created_at: 5,
+            body_hash: "ef".repeat(32),
+        }
+    }
+
+    impl Issuer for Keeping {
+        fn current_keyset(&self) -> Result<String, String> {
+            Ok("11".repeat(8))
+        }
+        fn transfer(&self, request: &TransferRequest) -> TransferOutcome {
+            Script(Mutex::new(vec![]), Mutex::new(0)).transfer(request)
+        }
+        fn transfer_kept(
+            &self,
+            request: &TransferRequest,
+            kept: Option<AirRequest>,
+            save: crate::esp_client::Save,
+        ) -> (TransferOutcome, Option<AirRequest>) {
+            let first = kept.is_none();
+            self.seen.lock().unwrap().push(kept);
+            if first {
+                save(&in_flight()).unwrap();
+                (
+                    TransferOutcome::Unknown("no reply".into()),
+                    Some(in_flight()),
+                )
+            } else {
+                (self.transfer(request), None)
+            }
+        }
+    }
+
+    fn context<'a>(keys: &'a Keysets, service_kp: &'a Keypair) -> IssueContext<'a> {
+        IssueContext {
+            service: ServiceDid::from(service_kp.public_key()),
+            service_keypair: service_kp,
+            fee_per_byte: 0,
+            current: keys.current(),
+            previous: None,
+            now: 0,
+            esp_keyset_ttl_secs: 3600,
+            max_items: crate::config::DEFAULT_MAX_ITEMS,
+        }
+    }
+
+    #[test]
+    fn a_request_in_flight_is_kept_with_its_transfer_and_handed_back_to_the_retry() {
+        let (mut issues, keys, d) = setup("kept");
+        let service_kp = kp(1);
+        let ctx = context(&keys, &service_kp);
+        let req = request(&[10]);
+        let issuer = Keeping {
+            seen: Mutex::new(vec![]),
+        };
+        let e = issue(&mut issues, &issuer, &req, &ctx).unwrap_err();
+        assert_eq!((e.status, e.code), (502, "issuer_unavailable"));
+        // It is in the file, in the pending group of the transfer it carries.
+        let file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(d.join(FILE_NAME)).unwrap()).unwrap();
+        let entry = &file["entries"][req.hash()];
+        assert_eq!(entry["entry"], "pending");
+        assert_eq!(entry["groups"][0]["air"]["request_id"], "ab".repeat(32));
+        assert_eq!(entry["groups"][0]["air"]["slots"], serde_json::json!([4]));
+        // A restart, then the retry: it is handed the same request.
+        let mut issues = Issues::open(&d).unwrap();
+        issue(&mut issues, &issuer, &req, &ctx).unwrap();
+        let seen = issuer.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].is_none());
+        assert_eq!(seen[1].as_ref(), Some(&in_flight()));
+        // The request is over with the transfer: nothing is kept in the file.
+        let text = std::fs::read_to_string(d.join(FILE_NAME)).unwrap();
+        assert!(!text.contains("\"air\""), "{text}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_pending_group_without_a_kept_request_reads_as_none_and_is_written_without_one() {
+        let (mut issues, keys, d) = setup("old-file");
+        let service_kp = kp(1);
+        let ctx = context(&keys, &service_kp);
+        let req = request(&[10]);
+        let issuer = Script(
+            Mutex::new(vec![TransferOutcome::Unknown("timeout".into())]),
+            Mutex::new(0),
+        );
+        issue(&mut issues, &issuer, &req, &ctx).unwrap_err();
+        // What a 0.5.0 file looks like: the same, with no `air` key at all.
+        let text = std::fs::read_to_string(d.join(FILE_NAME)).unwrap();
+        assert!(!text.contains("\"air\""), "{text}");
+        let issues = Issues::open(&d).unwrap();
+        match issues.data.entries.get(&req.hash()) {
+            Some(Entry::Pending(p)) => assert!(p.groups[0].air.is_none()),
+            other => panic!("expected a pending entry, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

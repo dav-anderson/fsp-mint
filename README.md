@@ -4,7 +4,9 @@ FSP is the fast point. Each AIR service runs its own copy of this mint and issue
 
 ## Building
 
-fsp-mint builds from tagged dependencies: mint-core at `v0.1.3` and `sp-wire` at `v0.2.0` (git tags). It does not use the `air` crate. Its tests start a real esp-mint in the process, so `esp-mint` at `v0.1.2` is a dev-dependency; the mint itself does not link esp-mint and talks to it over HTTP. To test against unpushed local copies, `source ~/sandbox-mint/scripts/local-git.sh` points git at the local folders and their local tags (the recipe, with the plain `[patch]` form, is in the top-level README in `sandbox-mint`).
+fsp-mint builds from tagged dependencies: mint-core at `v0.1.3` and `sp-wire` at `v0.4.0` (git tags), with sp-wire's `air-client` feature on. **AIR is the only way fsp-mint reaches the ESP mint, and it is always built in: there is no cargo feature.** The tests start a real esp-mint in the process, with its AIR listener, so `esp-mint` is a dev-dependency (the tests need an esp-mint that has `air_listener`); the mint itself does not link esp-mint.
+
+`air-client` needs `air_server`, which names `air` by a path outside its repository, and sp-wire's AIR pin (3.0.0) does not export `SecretKey` upstream. Until both are fixed, a build takes the local patches that the commented `[patch]` block in `Cargo.toml` lists (`sp-wire`, `air` and `air_server` from sibling folders, and `esp-mint` for the tests), in the git-ignored `.cargo/config.toml`, as the wallet's do. `source ~/sandbox-mint/scripts/local-git.sh` and `sh ~/sandbox-mint/scripts/test-wallet-against-local-mints.sh` (with `SP_LOCAL_AIR` and `SP_LOCAL_AIR_SERVER`) set that up. The tests also need port 5702 free: the AIR client always dials it, and the tests start an `air_server` there (they take turns on it).
 
 ## Run
 
@@ -14,7 +16,7 @@ cargo run -- service-key
 FSP_SERVICE_DID=<DID, 66 hex characters> cargo run -- serve
 ```
 
-`config` prints the settings in use. `service-key` makes `service_key.hex` and prints the service's DID (the 33-byte public key, 66 hex characters) to put in `service.did`. Start esp-mint first: fsp-mint checks its network at startup and sends it the ESP it accepts.
+`config` prints the settings in use. `service-key` makes `service_key.hex` and prints the service's DID (the 33-byte public key, 66 hex characters) to put in `service.did`. Start esp-mint first, with its AIR listener (`air.enabled`): fsp-mint asks it over AIR which network it is on before it starts, and sends it the ESP it accepts over AIR. `serve` needs the three AIR settings below (`air.esp_did`, `air.server`, `air.host`) and refuses to start without them.
 
 ## Settings
 
@@ -22,7 +24,7 @@ FSP_SERVICE_DID=<DID, 66 hex characters> cargo run -- serve
 
 | Setting | Env var | Default | What it does |
 |---|---|---|---|
-| `server.network` | `FSP_NETWORK` | `main` | `main`, `regtest`, `signet`, `testnet`. Checked at startup against the ESP mint's `/health`; a mismatch stops the mint. Also picks the data folder. |
+| `server.network` | `FSP_NETWORK` | `main` | `main`, `regtest`, `signet`, `testnet`. Checked at startup against the network in the ESP mint's mint info, asked over AIR; a mismatch stops the mint. Also picks the data folder. |
 | `server.bind` | `FSP_BIND` | `127.0.0.1:3200` | The HTTP API's address. |
 | `server.max_request_bytes` | `FSP_MAX_REQUEST_BYTES` | `1048576` | Ceiling on a request body, checked before parsing. 4096 to 1 GiB. |
 | `service.did` | `FSP_SERVICE_DID` | none | The service's DID: its 33-byte compressed public key, 66 hex characters starting `02` or `03`. The old 32-byte x-only form is refused. Only ESP named for it is accepted. Required to serve. |
@@ -33,10 +35,17 @@ FSP_SERVICE_DID=<DID, 66 hex characters> cargo run -- serve
 | `issue.max_items` | `FSP_ISSUE_MAX_ITEMS` | `1000` | The most groups in one issue request, and the most ESP notes and the most FSP outputs in one group. More is refused `400 too_many_items` before anything is spent. Served on `GET /fees`. 1 to 100,000. |
 | `spend.max_items` | `FSP_SPEND_MAX_ITEMS` | `1000` | The most notes in, and the most outputs, in one spend. More is refused `400 too_many_items`. Served on `GET /fees`. 1 to 100,000. |
 | `spend.max_memo_bytes` | `FSP_SPEND_MAX_MEMO_BYTES` | `256` | The longest memo on a spend. More is refused `400 memo_too_long`. Served on `GET /fees`. 0 to 65,536. |
-| `esp.url` | `FSP_ESP_URL` | `http://127.0.0.1:3100` | The ESP mint (Issuer) where accepted ESP is transferred. |
-| `esp.timeout_secs` | `FSP_ESP_TIMEOUT_SECS` | `30` | How long one ESP mint call may take. 1 to 600. |
-| `esp.keyset_ttl_secs` | `FSP_ESP_KEYSET_TTL_SECS` | `3600` | How long the cached ESP (Issuer) current keyset is used before it is read again; refreshed at once on `keyset_retired`. A failed read uses the cached set. 1 to 604800. |
+| `air.esp_did` | `FSP_AIR_ESP_DID` | none | **Required by `serve`.** The ESP mint's DID: its 33-byte compressed key, 66 hex characters (`esp-mint pubkey` prints it). The three calls to the ESP mint (mint info at start, keysets, transfer) are sealed to it, and its replies must be signed by it. There is no built-in DID. |
+| `air.server` | `FSP_AIR_SERVER` | none | **Required by `serve`.** The AIR server's name: its public key as AIR prints it (66 hex characters). Checked against the server's signed challenge. |
+| `air.host` | `FSP_AIR_HOST` | none | **Required by `serve`.** Where to reach that server: a host or IP, no scheme, path or port (the AIR client always dials 5702). `127.0.0.1` for a server on this machine. |
+| `air.reply_wait_secs` | `FSP_AIR_REPLY_WAIT_SECS` | `30` | How long to wait for the ESP mint's reply to one try. 1 to 600. |
+| `air.attempts` | `FSP_AIR_ATTEMPTS` | `3` | Tries per call before it gives up. A transfer with no reply leaves the issue pending (`502`), and its request is kept. 1 to 10. |
+| `air.max_skew_secs` | `FSP_AIR_MAX_SKEW_SECS` | `300` | How far a reply's `issued_at` may be from this mint's clock. 1 to 86400. |
+| `air.timeout_secs` | `FSP_AIR_TIMEOUT_SECS` | `10` | How long the AIR server may take to answer one `Create` or `Read`. 1 to 600. |
+| `esp.keyset_ttl_secs` | `FSP_ESP_KEYSET_TTL_SECS` | `3600` | How long the cached ESP (Issuer) current keyset, read over AIR, is used before it is read again; refreshed at once on `keyset_retired`. A failed read uses the cached set. 1 to 604800. |
 | `storage.mint_state` | `FSP_STORAGE_MINT_STATE` | none (local only) | Service DIDs (66 hex, comma-separated) that will keep the mint's state; index 0 is the primary. One is valid; at most 8. **Setting only: nothing reads or writes the AIR yet.** See [DESIGN.md](DESIGN.md), "Storage policy". |
+
+**`esp.url` and `esp.timeout_secs` (0.5.0 and before) are gone.** fsp-mint no longer calls the ESP mint over HTTP. A file or an environment that still names `esp.url`, `esp.timeout_secs`, `FSP_ESP_URL` or `FSP_ESP_TIMEOUT_SECS` stops the mint with a message that says so and names what replaces them (the `air.*` settings above). `esp.keyset_ttl_secs` is kept: the keyset is still cached, now read over AIR.
 
 **Every fee defaults to 0.** `fees.issue_fee_per_byte` is the only fee setting in fsp-mint, and with it at 0 an issue costs no more than the ESP it exchanges. A fee is charged only if the operator sets one.
 
@@ -46,7 +55,7 @@ FSP_SERVICE_DID=<DID, 66 hex characters> cargo run -- serve
 |---|---|
 | `config` | Prints the settings in use and the rotation schedule. |
 | `service-key` | Makes `service_key.hex` if there is none and prints its public half for `service.did`. |
-| `serve` | Runs the HTTP API. |
+| `serve` | Runs the HTTP API. Needs `air.esp_did`, `air.server` and `air.host` (it names any that is missing) and asks the ESP mint over AIR which network it is on before it starts. |
 | `audit [--json]` | Prints what the mint owes and holds: outstanding FSP per key set and in all, and the ESP in reserve, matured and unmatured, each in units and in PSP. Reads the data files and writes nothing, so it works while `serve` runs. See "Audit". |
 | `export-esp --out DIR` | Writes the kept ESP, one hand-over file per redeemable-after day, for the service's ecash-wallet to `receive` and `redeem`. Stop `serve` first. |
 
@@ -54,7 +63,7 @@ FSP_SERVICE_DID=<DID, 66 hex characters> cargo run -- serve
 
 | Route | What it does |
 |---|---|
-| `POST /issue` | ESP in, FSP out. Body: groups, one per redeemable-after day, each with its handed-over ESP notes (spend secret and `keyset`) and its blinded FSP outputs. `200` with the signed outputs and the keyset that signed them. `400` if refused (nothing spent), with `code` (`wrong_service`, `missing_keyset`, `too_many_items`, `note_held`, ...). `413` if the body is over `server.max_request_bytes`. `502` with `issuer_unavailable` or `issuer_refused` when the ESP mint could not be reached or refused the transfer; the request stays pending and a retry finishes it. See [DESIGN.md](DESIGN.md), "Crash ordering (ESP to FSP)". |
+| `POST /issue` | ESP in, FSP out. Body: groups, one per redeemable-after day, each with its handed-over ESP notes (spend secret and `keyset`) and its blinded FSP outputs. `200` with the signed outputs and the keyset that signed them. `400` if refused (nothing spent), with `code` (`wrong_service`, `missing_keyset`, `too_many_items`, `note_held`, ...). `413` if the body is over `server.max_request_bytes`. `502` with `issuer_unavailable` or `issuer_refused` when the ESP mint did not answer over AIR or refused the transfer; the request stays pending, with the request to the ESP mint kept in `issues.json`, and a retry finishes it without writing a second request. See [DESIGN.md](DESIGN.md), "Crash ordering (ESP to FSP)". |
 | `POST /spend` | A swap with change. Body: FSP inputs (each with its keyset, proof and spend signature), change outputs, the amount paid and a memo. `200` with the change signatures. `400` if refused, with `code` (`no_inputs`, `too_many_items`, `memo_too_long`, `already_spent`, `keyset_retired`, `unknown_keyset`, ...). Nothing is spent unless the whole request passes. See [DESIGN.md](DESIGN.md), "Spending (the fast path)". |
 | `GET /keys` | The public keys of the current and previous keysets, by ID. |
 | `GET /fees` | The fees and limits in force: `issue_fee_per_byte`, the issue size formula (`issue_group_fixed_bytes` 16, `issue_note_bytes` 106, `issue_output_bytes` 41), `max_request_bytes`, `issue_max_items`, `spend_max_items` and `spend_max_memo_bytes`. The wallet does not read these yet (it reads only the ESP mint's limits); an FSP request over a limit is refused by the mint before anything is spent. |

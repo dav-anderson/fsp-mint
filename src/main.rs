@@ -7,7 +7,8 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use fsp_mint::config::{self, Config};
-use fsp_mint::esp_client::{self, HttpIssuer};
+use fsp_mint::esp_air::AirIssuer;
+use fsp_mint::esp_client::{self, Issuer};
 use fsp_mint::issue::Issues;
 use fsp_mint::server::{self, FspState};
 use fsp_mint::spend::Spender;
@@ -25,6 +26,9 @@ fsp-mint <command>
                        none, and print its public half for service.did.
   serve                Run the HTTP API (POST /issue, POST /spend, GET /keys,
                        GET /fees, GET /rotation, GET /audit, GET /health).
+                       The ESP mint is reached over AIR only: needs air.esp_did,
+                       air.server and air.host, and asks the ESP mint which
+                       network it is on before it starts.
   audit [--json]       Print what the mint owes and holds: outstanding FSP per
                        key set and in total (in FSP units and PSP), and the ESP
                        in reserve, matured and unmatured. Reads the data files,
@@ -198,16 +202,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
             Ok(())
         }
         "serve" => {
+            // The ESP mint is reached over AIR only: without its DID and the
+            // AIR server, serve does not start.
+            cfg.require_air()?;
             let keypair = load_key(&dir, &cfg)?;
-            let issuer = HttpIssuer::new(&cfg.esp_url, cfg.esp_timeout_secs)?;
-            let reported = issuer
-                .network()
-                .map_err(|e| format!("cannot ask the ESP mint at {} which network it is on: {e}. Start esp-mint serve first", cfg.esp_url))?;
+            let issuer = AirIssuer::new(&cfg)?;
+            let at = issuer.describe();
+            let reported = issuer.network().map_err(|e| {
+                format!(
+                    "cannot ask the ESP mint ({at}) which network it is on: {e}. Start esp-mint serve, with its AIR listener, first"
+                )
+            })?;
             esp_client::check_network(&cfg.network, reported.as_deref())?;
-            println!(
-                "{}",
-                esp_client::same_network_line(&cfg.network, &cfg.esp_url)
-            );
+            println!("{}", esp_client::same_network_line(&cfg.network, &at));
             let spender = Spender::open(
                 &dir,
                 cfg.rotation(),

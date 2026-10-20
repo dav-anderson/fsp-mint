@@ -1,19 +1,32 @@
 //! fsp-mint end to end: a real ESP mint (the Issuer) in-process, fsp-mint in
 //! front of it, and the app side built the way the wallet builds it.
+//!
+//! fsp-mint reaches the ESP mint over AIR only, so every test here runs the ESP
+//! mint's own AIR listener against a real `air_server` started in this process
+//! (`sp_wire::air_request::local_server`), and fsp-mint's Issuer is the real
+//! `AirIssuer`. The AIR client always dials port 5702 (upstream item 12), so
+//! these tests need that port free, and they take turns on the one shared server
+//! (it has a single storage worker, so tests running in parallel starve each
+//! other past their timeouts). The ESP mint's HTTP routes are still served, but
+//! only so that the tests can read its `/audit`; fsp-mint does not call them.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use axum::Router;
+use esp_mint::air_listener::{self, Serve, Settings};
 use esp_mint::exchange::{Burn, Psp};
 use esp_mint::responses::Responses;
 use esp_mint::server::EspState;
 use esp_mint::terms::Terms;
 use fsp_mint::api::*;
 use fsp_mint::audit::{self, Report};
-use fsp_mint::esp_client::HttpIssuer;
+use fsp_mint::config::Config;
+use fsp_mint::esp_air::AirIssuer;
+use fsp_mint::esp_client::Issuer;
 use fsp_mint::issue::{Entry, IssueData, Issues};
 use fsp_mint::keysets::Keyset;
 use fsp_mint::server::{self, FspState};
@@ -22,6 +35,9 @@ use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, PublicKey, SECP256K1, SecretKey};
 use sp_wire::ServiceDid;
+use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
+use sp_wire::air_request::{addr, local_server};
+use sp_wire::seal::SecretKey as DidKey;
 use tokio::runtime::Runtime;
 
 const NOW: u64 = 1_791_571_184;
@@ -67,25 +83,172 @@ fn serve(rt: &Runtime, app: Router) -> String {
     format!("http://{a}")
 }
 
-fn start_esp(rt: &Runtime, dir: &Path) -> (String, Arc<EspState>) {
-    let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
-    let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
+/// One test at a time on the shared AIR server.
+static AIR_TURN: Mutex<()> = Mutex::new(());
+
+/// The shared server plus this test's turn on it; the turn ends when this drops,
+/// whether the test passed, failed or panicked.
+struct Server {
+    server: ServerRef,
+    _turn: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for Server {
+    type Target = ServerRef;
+
+    fn deref(&self) -> &ServerRef {
+        &self.server
+    }
+}
+
+fn server() -> Server {
+    let turn = AIR_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let server = local_server::start().expect("a local AIR server (is port 5702 free?)");
+    Server {
+        server,
+        _turn: turn,
+    }
+}
+
+/// The ESP mint's AIR listener on a thread of its own, as `esp-mint serve` runs
+/// it. Dropping it stops it.
+struct Listener {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<JoinHandle<Result<(), String>>>,
+}
+
+fn start_serving(server: &ServerRef, key: &DidKey, dir: &Path, serve: Arc<Serve>) -> Listener {
+    let settings = Settings {
+        server: server.clone(),
+        held_reads: 16,
+        timeout_secs: 10,
+        state_dir: dir.to_path_buf(),
+    };
+    let key = key.clone();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let thread = thread::Builder::new()
+        .name("test-air-listener".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(air_listener::run(&settings, &key, &serve, async move {
+                let _ = stopped.await;
+            }))
+        })
+        .unwrap();
+    Listener {
+        stop: Some(stop),
+        thread: Some(thread),
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The ESP mint as fsp-mint reaches it: its DID and the AIR server (what the
+/// `air.*` settings name), its listener (which a test may stop and start again,
+/// as an ESP mint that is down and comes back), and its HTTP base, which only
+/// the tests read (`/audit`).
+struct EspAt {
+    url: String,
+    did: ServiceDid,
+    key: DidKey,
+    state: Arc<EspState>,
+    /// The ESP mint's data folder: where the listener keeps `air_mailbox_next`.
+    data: PathBuf,
+    listener: Mutex<Option<Listener>>,
+    /// Last, so the turn on the AIR server ends after the listener has stopped.
+    server: Server,
+}
+
+impl EspAt {
+    /// What `esp-mint serve` hands its listener to answer with.
+    fn serve(&self) -> Arc<Serve> {
+        let state = Arc::clone(&self.state);
+        Arc::new(move |kind: u8, body: &[u8]| esp_mint::server::air_served(&state, kind, body))
+    }
+
+    /// Start the listener (the ESP mint is answering).
+    fn listen(&self) {
+        let listener = start_serving(&self.server, &self.key, &self.data, self.serve());
+        *self.listener.lock().unwrap() = Some(listener);
+    }
+
+    /// Stop the listener (the ESP mint is not answering).
+    fn silence(&self) {
+        drop(self.listener.lock().unwrap().take());
+    }
+
+    /// Wait until the listener has taken `want` mailbox slots (it has answered
+    /// every request written to the slots below).
+    fn wait_for_next(&self, want: u32) {
+        let until = Instant::now() + Duration::from_secs(15);
+        loop {
+            let now = air_listener::read_next(&self.data).unwrap();
+            if now == want {
+                return;
+            }
+            assert!(
+                Instant::now() < until,
+                "the counter is {now}, expected {want}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The `air.*` settings that point fsp-mint at this ESP mint.
+    fn settings(&self, wait_secs: &str, attempts: &str) -> Vec<(&'static str, String)> {
+        vec![
+            ("air.esp_did", self.did.to_hex()),
+            ("air.server", self.server.name.clone()),
+            ("air.host", self.server.host.clone()),
+            ("air.reply_wait_secs", wait_secs.to_string()),
+            ("air.attempts", attempts.to_string()),
+        ]
+    }
+}
+
+/// A real ESP mint with its HTTP routes (for `/audit`) and its AIR listener, on
+/// the shared AIR server.
+fn start_esp(rt: &Runtime, dir: &Path) -> (EspAt, Arc<EspState>) {
+    let server = server();
+    let data = dir.join("esp");
+    let (logic, master) = esp_mint::mint::open(&data).unwrap();
+    let responses = Responses::open(&data.join("responses.json")).unwrap();
     let state = Arc::new(EspState {
         logic: Mutex::new(logic),
         master,
         psp: Box::new(NoPsp),
         responses: Mutex::new(responses),
-        queue_path: dir.join("esp").join("queue.json"),
+        queue_path: data.join("queue.json"),
         queue_lock: Mutex::new(()),
         in_flight: Default::default(),
         config: esp_mint::config::Handle::default(),
         rotor: None,
         rollovers: None,
     });
-    (
-        serve(rt, esp_mint::server::router(Arc::clone(&state))),
-        state,
-    )
+    let key = DidKey::new();
+    let at = EspAt {
+        url: serve(rt, esp_mint::server::router(Arc::clone(&state))),
+        did: addr::key_to_did(&key.public_key()),
+        key,
+        state: Arc::clone(&state),
+        data,
+        listener: Mutex::new(None),
+        server,
+    };
+    at.listen();
+    (at, state)
 }
 
 /// An ESP note the Issuer issued for `service` and `day`.
@@ -205,8 +368,24 @@ struct Fsp {
     clock: Arc<AtomicU64>,
 }
 
-fn start_fsp(rt: &Runtime, dir: &Path, esp_url: &str, activation: &str) -> Fsp {
-    let mut cfg = fsp_mint::config::Config::default();
+fn start_fsp(rt: &Runtime, dir: &Path, esp: &EspAt, activation: &str) -> Fsp {
+    start_fsp_waiting(rt, dir, esp, activation, "20", "2")
+}
+
+/// [`start_fsp`] with the time one try waits for the ESP mint's reply and the
+/// number of tries (a test with an ESP mint that is down does not wait long).
+fn start_fsp_waiting(
+    rt: &Runtime,
+    dir: &Path,
+    esp: &EspAt,
+    activation: &str,
+    wait_secs: &str,
+    attempts: &str,
+) -> Fsp {
+    let mut cfg = Config::default();
+    for (key, value) in esp.settings(wait_secs, attempts) {
+        cfg.set(key, &value).unwrap();
+    }
     cfg.set("service.did", &service().to_string()).unwrap();
     cfg.set("rotation.activation_hours", activation).unwrap();
     cfg.set("rotation.period_hours", "240").unwrap();
@@ -220,12 +399,13 @@ fn start_fsp(rt: &Runtime, dir: &Path, esp_url: &str, activation: &str) -> Fsp {
         Spender::open(&dir.join("fsp"), cfg.rotation(), 1024, NOW).unwrap()
     });
     let issues = Issues::open(&dir.join("fsp")).unwrap();
+    let issuer = AirIssuer::new(&cfg).unwrap();
     let c = Arc::clone(&clock);
     let state = Arc::new(FspState {
         config: cfg,
         spender,
         issues: Mutex::new(issues),
-        issuer: Box::new(HttpIssuer::new(esp_url, 10).unwrap()),
+        issuer: Box::new(issuer),
         service_keypair: Some(service_keypair()),
         clock: Box::new(move || c.load(Ordering::SeqCst)),
     });
@@ -260,8 +440,8 @@ fn current(f: &Fsp) -> Arc<Keyset> {
 fn issue_mixed_days_keeps_the_esp_and_never_issues_twice() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("issue");
-    let (esp_url, esp) = start_esp(&rt, &dir);
-    let f = start_fsp(&rt, &dir, &esp_url, "0");
+    let (esp_at, esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_at, "0");
     let day1 = Terms::new_at(service(), NOW).redeemable_after_day;
     let day2 = day1 + 30; // not mature: FSP ignores maturity
     let a = vec![
@@ -305,7 +485,7 @@ fn issue_mixed_days_keeps_the_esp_and_never_issues_twice() {
         "the ESP is kept, once"
     );
     // At the Issuer the ESP was transferred, not burned: outstanding unchanged.
-    let audit: serde_json::Value = reqwest::blocking::get(format!("{esp_url}/audit"))
+    let audit: serde_json::Value = reqwest::blocking::get(format!("{}/audit", esp_at.url))
         .unwrap()
         .json()
         .unwrap();
@@ -382,12 +562,14 @@ fn issue_mixed_days_keeps_the_esp_and_never_issues_twice() {
     );
 }
 
+/// The refused transfer over AIR: the ESP mint's signed `400` refusal for one
+/// group, which the other group does not share.
 #[test]
 fn an_esp_note_for_another_service_or_day_is_refused_by_the_issuer_for_its_group_only() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("partial");
-    let (esp_url, esp) = start_esp(&rt, &dir);
-    let f = start_fsp(&rt, &dir, &esp_url, "0");
+    let (esp_at, esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_at, "0");
     let day1 = Terms::new_at(service(), NOW).redeemable_after_day;
     let good = esp_note(&esp, 2, service(), day1);
     let bad = esp_note(&esp, 2, service(), day1 + 1); // claimed as day1 + 2 below
@@ -417,9 +599,9 @@ fn an_esp_note_for_another_service_or_day_is_refused_by_the_issuer_for_its_group
 fn rotation_keeps_previous_notes_for_one_period_then_they_are_lost() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("rotate");
-    let (esp_url, _esp) = start_esp(&rt, &dir);
+    let (esp_at, _esp) = start_esp(&rt, &dir);
     // Activation 120 hours after the first issue (NOW), period 240 hours.
-    let f = start_fsp(&rt, &dir, &esp_url, "120");
+    let f = start_fsp(&rt, &dir, &esp_at, "120");
     let genesis = current(&f);
     let before: RotationResponse = reqwest::blocking::get(format!("{}/rotation", f.url))
         .unwrap()
@@ -582,8 +764,8 @@ fn the_spend_limit_is_the_setting_and_is_served_on_fees() {
     // The mint serves both limits, so a wallet need not guess them.
     let rt = Runtime::new().unwrap();
     let dir = scratch("feeitems");
-    let (esp_url, _esp) = start_esp(&rt, &dir);
-    let f = start_fsp(&rt, &dir, &esp_url, "0");
+    let (esp_at, _esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_at, "0");
     let fees: FeesResponse = reqwest::blocking::get(format!("{}/fees", f.url))
         .unwrap()
         .json()
@@ -667,8 +849,8 @@ fn throughput_of_the_spend_path() {
 fn a_body_over_the_ceiling_is_refused_before_parsing() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("limit");
-    let (esp_url, _esp) = start_esp(&rt, &dir);
-    let f = start_fsp(&rt, &dir, &esp_url, "0");
+    let (esp_at, _esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_at, "0");
     let big = vec![b' '; 2 * 1024 * 1024];
     for route in ["issue", "spend"] {
         // A raw request: the mint answers from the header alone and may close
@@ -746,8 +928,8 @@ fn the_first_issue_starts_the_rotation_clock_once_and_survives_a_restart() {
 fn outputs_prepared_before_a_rotation_are_signed_by_the_new_set_and_the_reply_says_which() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("rotate-prepared");
-    let (esp_url, esp) = start_esp(&rt, &dir);
-    let f = start_fsp(&rt, &dir, &esp_url, "120");
+    let (esp_at, esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_at, "120");
     let genesis = current(&f);
     // Prepared under the genesis set: a note to spend, its outputs, and an
     // issue request with its outputs (blinding does not depend on the key).
@@ -878,8 +1060,8 @@ fn units(a: &audit::Amount) -> i128 {
 fn the_audit_counts_issue_spend_and_change_and_the_esp_reserve() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("audit-basic");
-    let (esp_url, esp) = start_esp(&rt, &dir);
-    let f = start_fsp(&rt, &dir, &esp_url, "0");
+    let (esp_at, esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_at, "0");
     let today = NOW / 86_400;
     let empty = get_audit(&f);
     assert_eq!(units(&empty.fsp.outstanding), 0);
@@ -987,8 +1169,8 @@ fn the_audit_counts_issue_spend_and_change_and_the_esp_reserve() {
 fn the_audit_follows_rotation_expiry_and_a_restart() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("audit-rotate");
-    let (esp_url, esp) = start_esp(&rt, &dir);
-    let f = start_fsp(&rt, &dir, &esp_url, "120");
+    let (esp_at, esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_at, "120");
     let day = NOW / 86_400 + 365;
     let g = current(&f).id.clone();
     let (a, a_key, ks_a) = issue_one(&esp, &f, 16, day);
@@ -1195,4 +1377,219 @@ fn what_was_answered_before_the_counters_is_reported_as_not_counted() {
         "{:?}",
         r.warnings
     );
+}
+
+// ---------------------------------------------------------------- over AIR
+
+/// One group of one ESP note of `units`, for `day`.
+fn one_group(esp: &EspState, units: u64, day: u64) -> IssueRequest {
+    IssueRequest {
+        service: service(),
+        groups: vec![IssueGroup {
+            redeemable_after_day: day,
+            notes: vec![esp_note(esp, units, service(), day)],
+            outputs: vec![Out::new(units).mint()],
+        }],
+    }
+}
+
+/// `Create` bytes in a mailbox slot of the ESP mint, as anyone may: `Created`
+/// says the slot was free, so nothing had been written to it.
+fn put(server: &ServerRef, key: &DidKey, bytes: Vec<u8>) -> client::Put {
+    block_on_new_runtime(move || async move {
+        let client = client::connect(server).await.unwrap();
+        client::create(&client, key, bytes, 10).await.unwrap()
+    })
+    .unwrap()
+}
+
+fn issues_file(dir: &Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(dir.join("fsp").join("issues.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn the_esp_mints_network_and_current_keyset_are_read_over_air() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("reads");
+    let (esp_at, esp) = start_esp(&rt, &dir);
+    let mut cfg = Config::default();
+    for (key, value) in esp_at.settings("20", "2") {
+        cfg.set(key, &value).unwrap();
+    }
+    let issuer = AirIssuer::new(&cfg).unwrap();
+    assert_eq!(issuer.network().unwrap().as_deref(), Some("main"));
+    assert_eq!(
+        issuer.current_keyset().unwrap(),
+        esp_mint::rotation::keyset_id(&esp.master)
+    );
+    assert!(issuer.describe().contains(&esp_at.did.to_hex()));
+}
+
+#[test]
+fn an_esp_mint_that_does_not_answer_leaves_the_issue_pending_and_the_retry_finishes_it_with_one_transfer()
+ {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("silent");
+    let (esp_at, esp) = start_esp(&rt, &dir);
+    // One short try: an ESP mint that is down is found out quickly (but long
+    // enough for a listener that is up).
+    let f = start_fsp_waiting(&rt, &dir, &esp_at, "0", "5", "1");
+    let day = Terms::new_at(service(), NOW).redeemable_after_day;
+
+    // A first issue: the keyset read is slot 0, its transfer slot 1.
+    let first = one_group(&esp, 2, day);
+    let (s, body) = post(&format!("{}/issue", f.url), &first);
+    assert_eq!(s, 200, "{body}");
+    esp_at.wait_for_next(2);
+
+    // The ESP mint goes quiet. The keyset is cached, so the transfer is sent,
+    // written to slot 2, and not answered.
+    esp_at.silence();
+    let second = one_group(&esp, 4, day);
+    let hash = second.hash();
+    let (s, body) = post(&format!("{}/issue", f.url), &second);
+    assert_eq!(s, 502, "{body}");
+    assert_eq!(body["code"], "issuer_unavailable", "{body}");
+    assert_eq!(f.state.issues.lock().unwrap().data.kept.len(), 1);
+    // The request in flight is kept in `issues.json`, beside its transfer.
+    let file = issues_file(&dir);
+    let air = file["entries"][&hash]["groups"][0]["air"].clone();
+    assert_eq!(air["mint"], esp_at.did.to_hex(), "{file}");
+    assert_eq!(air["slots"], serde_json::json!([2]), "{file}");
+    let request_id = air["request_id"].as_str().unwrap().to_string();
+    assert_eq!(request_id.len(), 64);
+
+    // The ESP mint comes back and answers the request that was waiting.
+    esp_at.listen();
+    esp_at.wait_for_next(3);
+
+    // A restart of fsp-mint, then the retry: it reads the reply cell of the same
+    // request, finds the answer, and writes nothing.
+    drop(f);
+    let f = start_fsp(&rt, &dir, &esp_at, "0");
+    let (s, body) = post(&format!("{}/issue", f.url), &second);
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["groups"][0]["result"], "issued", "{body}");
+    assert_eq!(f.state.issues.lock().unwrap().data.kept.len(), 2);
+    // Done: the stored answer, and no request kept.
+    let file = issues_file(&dir);
+    assert_eq!(file["entries"][&hash]["entry"], "done", "{file}");
+    assert!(!file.to_string().contains(&request_id), "{file}");
+    // No second request was written: slot 3 is still free.
+    let probe = put(
+        &esp_at.server,
+        &addr::mailbox_secret(&esp_at.did, 3),
+        vec![0u8; 8],
+    );
+    assert!(
+        matches!(probe, client::Put::Created(_)),
+        "the retry wrote a second request"
+    );
+    // And the transfer happened once at the ESP mint: 2 + 4 units transferred.
+    let audit: serde_json::Value = reqwest::blocking::get(format!("{}/audit", esp_at.url))
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(
+        audit["redeemed"]
+            .as_u64()
+            .or(audit["redeemed"].as_str().and_then(|s| s.parse().ok())),
+        Some(6),
+        "{audit}"
+    );
+}
+
+/// Run `fsp-mint` with `args` and exactly the environment `env` (plus the data
+/// folder `base`), and wait for it to end. A `serve` that does not stop is a
+/// failure of the test, not a hang.
+fn fsp_run(base: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_fsp-mint"))
+        .args(args)
+        .env_clear()
+        .env("FSP_DATA_DIR", base)
+        .envs(env.iter().copied())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(90);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() > until {
+            let _ = child.kill();
+            panic!("`fsp-mint {}` did not stop", args.join(" "));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn serve_refuses_to_start_when_the_esp_mint_is_on_another_network() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("mismatch");
+    let (esp_at, _esp) = start_esp(&rt, &dir); // reports "main"
+    let base = scratch("mismatch-run");
+    let did = esp_at.did.to_hex();
+    let air = [
+        ("FSP_NETWORK", "regtest"),
+        ("FSP_AIR_ESP_DID", did.as_str()),
+        ("FSP_AIR_SERVER", esp_at.server.name.as_str()),
+        ("FSP_AIR_HOST", esp_at.server.host.as_str()),
+        ("FSP_AIR_REPLY_WAIT_SECS", "20"),
+        ("FSP_AIR_ATTEMPTS", "2"),
+    ];
+    // The service key first, so that serve gets as far as the network check.
+    let made = fsp_run(&base, &["service-key"], &air);
+    let text = String::from_utf8_lossy(&made.stdout).to_string();
+    assert!(made.status.success(), "{text}");
+    let service_did = text
+        .lines()
+        .find_map(|l| l.strip_prefix("service.did = "))
+        .expect("the service DID is printed")
+        .trim()
+        .to_string();
+    let mut env = air.to_vec();
+    env.push(("FSP_SERVICE_DID", service_did.as_str()));
+    let out = fsp_run(&base, &["serve"], &env);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "serve started: {err}");
+    assert!(
+        err.contains("the ESP mint is on main") && err.contains("set to regtest"),
+        "{err}"
+    );
+    assert!(err.contains("Refusing to start"), "{err}");
+}
+
+#[test]
+fn serve_refuses_to_start_without_the_air_settings_and_names_each_missing_one() {
+    let base = scratch("no-air");
+    // None of the three.
+    let out = fsp_run(&base, &["serve"], &[]);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "serve started");
+    for missing in ["air.esp_did", "air.server", "air.host"] {
+        assert!(err.contains(missing), "{missing} is not named: {err}");
+    }
+    // Only the host set: the other two are named, the host is not.
+    let out = fsp_run(&base, &["serve"], &[("FSP_AIR_HOST", "127.0.0.1")]);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "serve started");
+    assert!(
+        err.contains("air.esp_did") && err.contains("air.server"),
+        "{err}"
+    );
+    assert!(!err.contains("FSP_AIR_HOST"), "{err}");
+    // The old settings are gone, with a message that says what replaces them.
+    let out = fsp_run(
+        &base,
+        &["config"],
+        &[("FSP_ESP_URL", "http://127.0.0.1:3100")],
+    );
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "config accepted esp.url");
+    assert!(err.contains("esp.url") && err.contains("is gone"), "{err}");
+    assert!(err.contains("air.esp_did"), "{err}");
 }

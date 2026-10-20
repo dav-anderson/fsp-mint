@@ -22,6 +22,22 @@ pub const FILE_ENV: &str = "FSP_CONFIG";
 /// `GET /fees`), never from this constant.
 pub const DEFAULT_MAX_ITEMS: usize = 1000;
 
+/// Settings that were taken out, with the environment variable each had and what
+/// replaces it. A file or an environment that still names one is refused with this
+/// text, not with "unknown setting".
+pub const REMOVED: &[(&str, &str, &str)] = &[
+    (
+        "esp.url",
+        "FSP_ESP_URL",
+        "`esp.url` is gone: fsp-mint reaches the ESP mint only over AIR now, not over HTTP. Set air.esp_did (the ESP mint's DID; `esp-mint pubkey` prints it), air.server and air.host (FSP_AIR_ESP_DID, FSP_AIR_SERVER, FSP_AIR_HOST) and remove esp.url",
+    ),
+    (
+        "esp.timeout_secs",
+        "FSP_ESP_TIMEOUT_SECS",
+        "`esp.timeout_secs` is gone: the calls to the ESP mint are over AIR, and the waits are air.reply_wait_secs, air.attempts and air.timeout_secs (FSP_AIR_REPLY_WAIT_SECS, FSP_AIR_ATTEMPTS, FSP_AIR_TIMEOUT_SECS). Remove esp.timeout_secs",
+    ),
+];
+
 pub struct Spec {
     pub key: &'static str,
     pub env: &'static str,
@@ -36,7 +52,7 @@ pub const SPECS: &[Spec] = &[
         env: "FSP_NETWORK",
         default: "main",
         units: "network",
-        what: "The Bitcoin network of the ESP mint this FSP mint takes ESP from: main, regtest, signet or testnet. To be checked against the ESP mint's /health.",
+        what: "The Bitcoin network of the ESP mint this FSP mint takes ESP from: main, regtest, signet or testnet. Checked at startup against the ESP mint's network, which it reports in its mint info (over AIR); a mismatch stops the mint.",
     },
     Spec {
         key: "server.bind",
@@ -109,25 +125,60 @@ pub const SPECS: &[Spec] = &[
         what: "The most spends written and synced to disk together. A spend is answered only after its batch is synced. 1 to 65536.",
     },
     Spec {
-        key: "esp.url",
-        env: "FSP_ESP_URL",
-        default: "http://127.0.0.1:3100",
-        units: "URL",
-        what: "The ESP mint (esp-mint serve) where accepted ESP is transferred to notes the service controls.",
-    },
-    Spec {
-        key: "esp.timeout_secs",
-        env: "FSP_ESP_TIMEOUT_SECS",
-        default: "30",
-        units: "seconds",
-        what: "How long one call to the ESP mint may take. 1 to 600.",
-    },
-    Spec {
         key: "esp.keyset_ttl_secs",
         env: "FSP_ESP_KEYSET_TTL_SECS",
         default: "3600",
         units: "seconds",
-        what: "How long the ESP mint's current keyset, which new issue transfers name for their outputs, is used before it is read again (GET /keysets). It is also read again at once when the ESP mint answers keyset_retired (the cached set was deleted; a set that has only become the previous one is still signed with). If a read fails, the cached keyset is used; only with none cached is an issue refused 502 issuer_unavailable. 1 to 604800.",
+        what: "How long the ESP mint's current keyset, which new issue transfers name for their outputs, is used before it is read again (its keysets over AIR). It is also read again at once when the ESP mint answers keyset_retired (the cached set was deleted; a set that has only become the previous one is still signed with). If a read fails, the cached keyset is used; only with none cached is an issue refused 502 issuer_unavailable. 1 to 604800.",
+    },
+    Spec {
+        key: "air.esp_did",
+        env: "FSP_AIR_ESP_DID",
+        default: "",
+        units: "service DID (66 hex characters)",
+        what: "The ESP mint's DID: the 33-byte compressed key of esp-mint's mint_did_key.json (`esp-mint pubkey` prints it), in hex. Where the requests to the ESP mint are sealed, and the key its replies must be signed by. Required by serve, with air.server and air.host: AIR is the only way fsp-mint reaches the ESP mint, and it has no built-in DID.",
+    },
+    Spec {
+        key: "air.server",
+        env: "FSP_AIR_SERVER",
+        default: "",
+        units: "AIR server name (66 hex characters)",
+        what: "The name of the AIR server that carries the requests to the ESP mint: its public key, the compressed hex AIR prints (66 characters, starting 02 or 03). fsp-mint checks the server's signed challenge against it. Resolving a mint's DID to its AIR server is not built, so it is configuration for now. With air.host and air.esp_did, it is how the three calls to the ESP mint (mint info, keysets, transfer) are made: all three are required by serve.",
+    },
+    Spec {
+        key: "air.host",
+        env: "FSP_AIR_HOST",
+        default: "",
+        units: "host name or IP, no port",
+        what: "Where to reach that AIR server: a host name or an IP with no scheme, no path and no port (the AIR client always dials port 5702 for ws). 127.0.0.1 for a server on this machine. Required by serve, with air.server and air.esp_did.",
+    },
+    Spec {
+        key: "air.reply_wait_secs",
+        env: "FSP_AIR_REPLY_WAIT_SECS",
+        default: "30",
+        units: "seconds (1 to 600)",
+        what: "How long to wait for the ESP mint's reply to one try of a request. After that the same request is written again, in the next free mailbox slot.",
+    },
+    Spec {
+        key: "air.attempts",
+        env: "FSP_AIR_ATTEMPTS",
+        default: "3",
+        units: "tries (1 to 10)",
+        what: "How many tries one call makes before it gives up. A transfer that gets no reply leaves the issue pending (502 issuer_unavailable): its request is kept in issues.json, and sending the same issue request again carries on with it and picks up a late reply, without writing a second request.",
+    },
+    Spec {
+        key: "air.max_skew_secs",
+        env: "FSP_AIR_MAX_SKEW_SECS",
+        default: "300",
+        units: "seconds (1 to 86400)",
+        what: "How far the reply's issued_at (the ESP mint's clock) may be from this mint's clock before the reply is refused as stale. A kept request answered later than this is dropped and the same transfer is sent in a new request (the ESP mint answers it from its stored answer).",
+    },
+    Spec {
+        key: "air.timeout_secs",
+        env: "FSP_AIR_TIMEOUT_SECS",
+        default: "10",
+        units: "seconds (1 to 600)",
+        what: "How long the AIR server may take to answer one Create or Read before that step fails.",
     },
     Spec {
         key: "storage.mint_state",
@@ -143,9 +194,17 @@ pub struct Config {
     pub network: String,
     pub bind: String,
     pub max_request_bytes: u64,
-    pub esp_url: String,
-    pub esp_timeout_secs: u64,
     pub esp_keyset_ttl_secs: u64,
+    /// The ESP mint's DID, for the calls over AIR.
+    pub air_esp_did: Option<ServiceDid>,
+    /// The AIR server's name (its public key), or empty.
+    pub air_server: String,
+    /// The AIR server's host or IP, or empty.
+    pub air_host: String,
+    pub air_reply_wait_secs: u64,
+    pub air_attempts: u64,
+    pub air_max_skew_secs: u64,
+    pub air_timeout_secs: u64,
     pub service_did: String,
     pub issue_fee_per_byte: u64,
     pub rotation_activation_hours: u64,
@@ -164,9 +223,14 @@ impl Default for Config {
             network: "main".into(),
             bind: "127.0.0.1:3200".into(),
             max_request_bytes: 1024 * 1024,
-            esp_url: "http://127.0.0.1:3100".into(),
-            esp_timeout_secs: 30,
             esp_keyset_ttl_secs: 3600,
+            air_esp_did: None,
+            air_server: String::new(),
+            air_host: String::new(),
+            air_reply_wait_secs: 30,
+            air_attempts: 3,
+            air_max_skew_secs: 300,
+            air_timeout_secs: 10,
             service_did: String::new(),
             issue_fee_per_byte: 0,
             rotation_activation_hours: 8760,
@@ -199,15 +263,29 @@ fn whole(key: &str, value: &str) -> Result<u64, String> {
         .map_err(|_| format!("{key} = `{value}` is not a whole number (no sign, no decimals)"))
 }
 
+fn in_range(key: &str, value: &str, min: u64, max: u64) -> Result<u64, String> {
+    match value.trim().parse::<u64>() {
+        Ok(n) if (min..=max).contains(&n) => Ok(n),
+        _ => Err(format!(
+            "{key} = `{value}` must be a whole number from {min} to {max}"
+        )),
+    }
+}
+
 impl Config {
     pub fn get(&self, key: &str) -> Option<String> {
         Some(match key {
             "server.network" => self.network.clone(),
             "server.bind" => self.bind.clone(),
             "server.max_request_bytes" => self.max_request_bytes.to_string(),
-            "esp.url" => self.esp_url.clone(),
-            "esp.timeout_secs" => self.esp_timeout_secs.to_string(),
             "esp.keyset_ttl_secs" => self.esp_keyset_ttl_secs.to_string(),
+            "air.esp_did" => self.air_esp_did.map(|d| d.to_hex()).unwrap_or_default(),
+            "air.server" => self.air_server.clone(),
+            "air.host" => self.air_host.clone(),
+            "air.reply_wait_secs" => self.air_reply_wait_secs.to_string(),
+            "air.attempts" => self.air_attempts.to_string(),
+            "air.max_skew_secs" => self.air_max_skew_secs.to_string(),
+            "air.timeout_secs" => self.air_timeout_secs.to_string(),
             "service.did" => self.service_did.clone(),
             "fees.issue_fee_per_byte" => self.issue_fee_per_byte.to_string(),
             "rotation.activation_hours" => self.rotation_activation_hours.to_string(),
@@ -226,9 +304,37 @@ impl Config {
             "server.network" => self.network = network_name(value)?.to_string(),
             "server.bind" => self.bind = value.trim().to_string(),
             "server.max_request_bytes" => self.max_request_bytes = whole(key, value)?,
-            "esp.url" => self.esp_url = value.trim().to_string(),
-            "esp.timeout_secs" => self.esp_timeout_secs = whole(key, value)?,
             "esp.keyset_ttl_secs" => self.esp_keyset_ttl_secs = whole(key, value)?,
+            "air.esp_did" => {
+                let text = value.trim();
+                self.air_esp_did = if text.is_empty() {
+                    None
+                } else {
+                    Some(ServiceDid::parse(text).map_err(|e| format!("{key} = `{value}`: {e}"))?)
+                };
+            }
+            "air.server" => {
+                let text = value.trim();
+                if !text.is_empty() {
+                    sp_wire::seal::parse_public_key(text).map_err(|e| {
+                        format!(
+                            "{key} = `{value}` is not an AIR server name (a public key, 66 hex characters): {e}"
+                        )
+                    })?;
+                }
+                self.air_server = text.to_string();
+            }
+            "air.host" => {
+                let text = value.trim();
+                if let Some(why) = sp_wire::air_request::host_problem(text) {
+                    return Err(format!("{key} = `{value}` {why}"));
+                }
+                self.air_host = text.to_string();
+            }
+            "air.reply_wait_secs" => self.air_reply_wait_secs = in_range(key, value, 1, 600)?,
+            "air.attempts" => self.air_attempts = in_range(key, value, 1, 10)?,
+            "air.max_skew_secs" => self.air_max_skew_secs = in_range(key, value, 1, 86_400)?,
+            "air.timeout_secs" => self.air_timeout_secs = in_range(key, value, 1, 600)?,
             "service.did" => self.service_did = value.trim().to_lowercase(),
             "fees.issue_fee_per_byte" => self.issue_fee_per_byte = whole(key, value)?,
             "rotation.activation_hours" => self.rotation_activation_hours = whole(key, value)?,
@@ -255,18 +361,6 @@ impl Config {
             p.push(format!(
                 "server.max_request_bytes = {} must be 4096 to 1073741824 bytes",
                 self.max_request_bytes
-            ));
-        }
-        if !(self.esp_url.starts_with("http://") || self.esp_url.starts_with("https://")) {
-            p.push(format!(
-                "esp.url = `{}` must start with http:// or https://",
-                self.esp_url
-            ));
-        }
-        if !(1..=600).contains(&self.esp_timeout_secs) {
-            p.push(format!(
-                "esp.timeout_secs = {} must be 1 to 600 seconds",
-                self.esp_timeout_secs
             ));
         }
         if !(1..=604_800).contains(&self.esp_keyset_ttl_secs) {
@@ -323,6 +417,31 @@ impl Config {
             ));
         }
         if p.is_empty() { Ok(()) } else { Err(p) }
+    }
+
+    /// What `serve` needs: the AIR settings, all three, because AIR is the only
+    /// way this mint reaches the ESP mint. The error names every one that is
+    /// not set. (The other commands do not talk to the ESP mint and do not need
+    /// them.)
+    pub fn require_air(&self) -> Result<(), String> {
+        let mut missing = Vec::new();
+        if self.air_esp_did.is_none() {
+            missing.push("air.esp_did (FSP_AIR_ESP_DID)");
+        }
+        if self.air_server.is_empty() {
+            missing.push("air.server (FSP_AIR_SERVER)");
+        }
+        if self.air_host.is_empty() {
+            missing.push("air.host (FSP_AIR_HOST)");
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "serve needs the AIR settings, because AIR is the only way fsp-mint reaches the ESP mint, and {} {} not set. air.esp_did is the ESP mint's DID (`esp-mint pubkey` prints it), air.server the AIR server's name and air.host where to reach it",
+            missing.join(", "),
+            if missing.len() == 1 { "is" } else { "are" }
+        ))
     }
 
     /// The service's DID, if set and valid.
@@ -396,6 +515,10 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
         };
         for (name, value) in body {
             let key = format!("{section}.{name}");
+            if let Some((_, _, why)) = REMOVED.iter().find(|(k, _, _)| *k == key) {
+                problems.push((*why).to_string());
+                continue;
+            }
             if !SPECS.iter().any(|s| s.key == key) {
                 problems.push(format!("unknown setting `{key}`"));
                 continue;
@@ -459,6 +582,11 @@ pub fn load(data_dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Loa
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound && !must_exist => {}
         Err(e) => problems.push(format!("cannot read config file {}: {e}", path.display())),
+    }
+    for (_, name, why) in REMOVED {
+        if env(name).is_some_and(|v| !v.is_empty()) {
+            problems.push(format!("environment variable {name}: {why}"));
+        }
     }
     for spec in SPECS {
         if let Some(value) = env(spec.env).filter(|v| !v.is_empty()) {
@@ -660,29 +788,127 @@ mod tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
+    /// A DID that parses: the curve's generator, even.
+    const ESP_DID: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
     #[test]
     fn file_then_env_with_sources() {
         let d = dir("order");
         fs::write(
             d.join(FILE_NAME),
-            "[esp]\nurl = \"http://10.0.0.1:3100\"\ntimeout_secs = 5\n",
+            "[air]\nhost = \"10.0.0.1\"\nattempts = 5\n",
         )
         .unwrap();
-        let env = |n: &str| (n == "FSP_ESP_TIMEOUT_SECS").then(|| "7".to_string());
+        let env = |n: &str| (n == "FSP_AIR_ATTEMPTS").then(|| "7".to_string());
         let l = load(&d, &env).unwrap();
-        assert_eq!(l.config.esp_url, "http://10.0.0.1:3100");
-        assert_eq!(l.config.esp_timeout_secs, 7);
-        assert_eq!(l.sources["esp.url"], Source::File);
-        assert_eq!(
-            l.sources["esp.timeout_secs"],
-            Source::Env("FSP_ESP_TIMEOUT_SECS")
-        );
+        assert_eq!(l.config.air_host, "10.0.0.1");
+        assert_eq!(l.config.air_attempts, 7);
+        assert_eq!(l.sources["air.host"], Source::File);
+        assert_eq!(l.sources["air.attempts"], Source::Env("FSP_AIR_ATTEMPTS"));
         assert!(
             l.describe()
                 .iter()
-                .any(|x| x == "  esp.timeout_secs = 7 seconds (env FSP_ESP_TIMEOUT_SECS)")
+                .any(|x| x == "  air.attempts = 7 tries (1 to 10) (env FSP_AIR_ATTEMPTS)")
         );
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_air_settings_have_defaults_and_are_checked() {
+        let c = Config::default();
+        assert_eq!(
+            (
+                c.air_reply_wait_secs,
+                c.air_attempts,
+                c.air_max_skew_secs,
+                c.air_timeout_secs
+            ),
+            (30, 3, 300, 10)
+        );
+        assert!(c.air_esp_did.is_none() && c.air_server.is_empty() && c.air_host.is_empty());
+        let mut c = Config::default();
+        c.set("air.esp_did", ESP_DID).unwrap();
+        assert_eq!(c.get("air.esp_did").unwrap(), ESP_DID);
+        for (key, value) in [
+            ("air.esp_did", "zz"),
+            ("air.esp_did", &ESP_DID[2..]),
+            ("air.server", "zz"),
+            ("air.host", "ws://127.0.0.1"),
+            ("air.host", "127.0.0.1:5702"),
+            ("air.host", "a b"),
+            ("air.attempts", "0"),
+            ("air.attempts", "11"),
+            ("air.reply_wait_secs", "0"),
+            ("air.reply_wait_secs", "soon"),
+            ("air.max_skew_secs", "86401"),
+            ("air.timeout_secs", "601"),
+        ] {
+            let e = Config::default().set(key, value).unwrap_err();
+            assert!(e.contains(key), "{key} = {value}: {e}");
+        }
+    }
+
+    #[test]
+    fn serve_needs_all_three_air_settings_and_names_each_missing_one() {
+        let c = Config::default();
+        let e = c.require_air().unwrap_err();
+        for name in ["air.esp_did", "air.server", "air.host"] {
+            assert!(e.contains(name), "{e}");
+        }
+        let mut c = Config::default();
+        c.set("air.esp_did", ESP_DID).unwrap();
+        c.set("air.host", "127.0.0.1").unwrap();
+        let e = c.require_air().unwrap_err();
+        assert!(e.contains("FSP_AIR_SERVER"), "{e}");
+        assert!(
+            !e.contains("FSP_AIR_HOST") && !e.contains("FSP_AIR_ESP_DID"),
+            "{e}"
+        );
+        assert!(e.contains("is not set"), "{e}");
+        c.set("air.server", ESP_DID).unwrap();
+        assert!(c.require_air().is_ok());
+    }
+
+    #[test]
+    fn the_removed_esp_settings_get_a_clear_error() {
+        let d = dir("removed");
+        fs::write(
+            d.join(FILE_NAME),
+            "[esp]\nurl = \"http://127.0.0.1:3100\"\ntimeout_secs = 5\nkeyset_ttl_secs = 60\n",
+        )
+        .unwrap();
+        let p = load(&d, &no_env).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("`esp.url` is gone") && x.contains("air.esp_did")),
+            "{p:?}"
+        );
+        assert!(
+            p.iter()
+                .any(|x| x.contains("`esp.timeout_secs` is gone") && x.contains("air.attempts")),
+            "{p:?}"
+        );
+        assert!(
+            !p.iter().any(|x| x.contains("unknown setting")),
+            "they are not reported as unknown: {p:?}"
+        );
+        // esp.keyset_ttl_secs still means something (the cache of the ESP mint's keyset).
+        assert!(!p.iter().any(|x| x.contains("keyset_ttl_secs")), "{p:?}");
+        fs::remove_dir_all(&d).unwrap();
+        // The same from the environment.
+        let env =
+            |n: &str| matches!(n, "FSP_ESP_URL" | "FSP_ESP_TIMEOUT_SECS").then(|| "x".to_string());
+        let p = load(&dir("removed-env"), &env).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("environment variable FSP_ESP_URL") && x.contains("is gone")),
+            "{p:?}"
+        );
+        assert!(
+            p.iter()
+                .any(|x| x.contains("environment variable FSP_ESP_TIMEOUT_SECS")),
+            "{p:?}"
+        );
     }
 
     #[test]
@@ -693,7 +919,7 @@ mod tests {
             "[server]\nbind = \"nowhere\"\nnope = 1\n",
         )
         .unwrap();
-        let env = |n: &str| (n == "FSP_ESP_TIMEOUT_SECS").then(|| "x".to_string());
+        let env = |n: &str| (n == "FSP_AIR_ATTEMPTS").then(|| "x".to_string());
         let p = load(&d, &env).unwrap_err();
         assert!(
             p.iter()
@@ -702,10 +928,7 @@ mod tests {
         );
         let env = |n: &str| (n == "FSP_NETWORK").then(|| "moon".to_string());
         assert!(load(&dir("net"), &env).unwrap_err()[0].contains("not a network"));
-        assert!(
-            p.iter().any(|x| x.contains("FSP_ESP_TIMEOUT_SECS")),
-            "{p:?}"
-        );
+        assert!(p.iter().any(|x| x.contains("FSP_AIR_ATTEMPTS")), "{p:?}");
         let env = |n: &str| (n == "FSP_MAX_REQUEST_BYTES").then(|| "10".to_string());
         assert!(load(&dir("range"), &env).unwrap_err()[0].contains("4096"));
         let env = |n: &str| (n == FILE_ENV).then(|| "/nonexistent/fsp.toml".to_string());

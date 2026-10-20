@@ -7,12 +7,14 @@
 //! - [`store`]: atomic JSON files.
 //! - [`issue`]: `POST /issue`, ESP in (transferred at the Issuer and kept), FSP out.
 //! - [`spend`]: `POST /spend`, the fast path, with the spent lists and their log.
-//! - [`esp_client`]: the calls to the ESP mint.
+//! - [`esp_client`]: the calls to the ESP mint (the Issuer) and what they return.
+//! - [`esp_air`]: those calls over AIR, the only way this mint reaches the ESP mint.
 //! - [`server`]: the HTTP routes.
 
 pub mod api;
 pub mod audit;
 pub mod config;
+pub mod esp_air;
 pub mod esp_client;
 pub mod issue;
 pub mod keysets;
