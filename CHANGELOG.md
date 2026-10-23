@@ -2,6 +2,10 @@
 
 fsp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.6.0 (2026-10-22): sp-wire v0.5.0 and esp-mint v0.7.0 from GitHub
+
+**Builds from GitHub with no local patch.** `Cargo.toml` names `sp-wire` at tag `v0.5.0` (it named `v0.4.0`, which has no `air-client`) and the dev-dependency `esp-mint` at tag `v0.7.0` (it named `v0.5.0`, which has no `air_listener` or `EspState::open`), and the committed `Cargo.lock` follows. sp-wire 0.5.0 pins AIR at `eae5133` (3.0.0 plus the `SecretKey` export) and air_server at `v1.0.1`, which takes `air` from crates.io, so `Cargo.toml` adds `[patch.crates-io] air` at that AIR commit; the commented local patches for AIR and air_server are gone, and the README's "Building" says this. No code change. Tests: 66, unchanged.
+
 ## 0.6.0 (unreleased)
 
 **The calls to the ESP mint, and the wallets' calls to this mint, go over AIR, and only over AIR.** Builds on `sp-wire` with the `air-client` feature (a build needs the local AIR patches, see the README, "Building"); `Cargo.toml` still names `sp-wire` and the `esp-mint` test dependency by their old tags.
