@@ -2,13 +2,16 @@
 
 fsp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.7.0 (2026-10-23): mint-core v0.2.0 and rust-version 1.93
+
+- **Changed: mint-core `v0.2.0`, and the unused `mint-server` dependency is gone.** mint-core's `server` crate no longer exists (nothing ran its `mintd`); fsp-mint declared it and never used it. Pins: mint-core, mint-types and bdhke `v0.2.0` (from `v0.1.3`); sp-wire `v0.5.1` (from `v0.5.0`): v0.5.0 pins mint-types `v0.1.3`, and two mint-types builds in one graph do not compile. No source change. The dev-dependency esp-mint moves to `v0.8.0`, which builds on mint-core `v0.2.0` and sp-wire `v0.5.1`.
+- **Changed: `rust-version` 1.93** (from 1.85), and the nested `if let` blocks are let chains. No behaviour change.
+
 ## 0.6.0 (2026-10-22): sp-wire v0.5.0 and esp-mint v0.7.0 from GitHub
 
 **Builds from GitHub with no local patch.** `Cargo.toml` names `sp-wire` at tag `v0.5.0` (it named `v0.4.0`, which has no `air-client`) and the dev-dependency `esp-mint` at tag `v0.7.0` (it named `v0.5.0`, which has no `air_listener` or `EspState::open`), and the committed `Cargo.lock` follows. sp-wire 0.5.0 pins AIR at `eae5133` (3.0.0 plus the `SecretKey` export) and air_server at `v1.0.1`, which takes `air` from crates.io, so `Cargo.toml` adds `[patch.crates-io] air` at that AIR commit; the commented local patches for AIR and air_server are gone, and the README's "Building" says this. No code change. Tests: 66, unchanged.
 
 ## 0.6.0 (unreleased)
-
-- **Changed: mint-core `v0.2.0`, and the unused `mint-server` dependency is gone.** mint-core's `server` crate no longer exists (nothing ran its `mintd`); fsp-mint declared it and never used it. Pins: mint-core, mint-types and bdhke `v0.2.0` (from `v0.1.3`); sp-wire stays at `v0.5.0`. No source change. The dev-dependency esp-mint `v0.7.0` must be tagged on mint-core `v0.2.0` and sp-wire `v0.5.1`.
 
 **The calls to the ESP mint, and the wallets' calls to this mint, go over AIR, and only over AIR.** Builds on `sp-wire` with the `air-client` feature (a build needs the local AIR patches, see the README, "Building"); `Cargo.toml` still names `sp-wire` and the `esp-mint` test dependency by their old tags.
 
