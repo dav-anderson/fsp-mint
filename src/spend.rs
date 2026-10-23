@@ -322,10 +322,10 @@ impl Spender {
                     continue;
                 }
                 for (ks, n) in &record.n {
-                    if live_ids.contains(ks) {
-                        if let Some(n) = parse_nonce(n) {
-                            spent.entry(ks.clone()).or_default().insert(n);
-                        }
+                    if live_ids.contains(ks)
+                        && let Some(n) = parse_nonce(n)
+                    {
+                        spent.entry(ks.clone()).or_default().insert(n);
                     }
                 }
                 answers.insert(
@@ -809,10 +809,10 @@ fn writer(
         }
         if result.is_ok() {
             for id in &touched {
-                if let Some(f) = files.get(id) {
-                    if let Err(e) = f.sync_data() {
-                        result = Err(format!("spend log sync failed: {e}"));
-                    }
+                if let Some(f) = files.get(id)
+                    && let Err(e) = f.sync_data()
+                {
+                    result = Err(format!("spend log sync failed: {e}"));
                 }
             }
         }

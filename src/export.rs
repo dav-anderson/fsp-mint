@@ -72,7 +72,7 @@ pub fn export_esp(
                     let k = &issues.data.kept[i];
                     HandedNote {
                         amount: k.amount,
-                        note: k.note.clone(),
+                        note: k.note,
                         spend_secret: k.spend_secret,
                         keyset: k.keyset.clone(),
                     }

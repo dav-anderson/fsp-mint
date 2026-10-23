@@ -223,10 +223,10 @@ fn esp_keyset(
     issuer: &dyn Issuer,
     ctx: &IssueContext,
 ) -> Result<String, IssueError> {
-    if let Some((k, at)) = &issues.esp_keyset {
-        if ctx.now < at.saturating_add(ctx.esp_keyset_ttl_secs) {
-            return Ok(k.clone());
-        }
+    if let Some((k, at)) = &issues.esp_keyset
+        && ctx.now < at.saturating_add(ctx.esp_keyset_ttl_secs)
+    {
+        return Ok(k.clone());
     }
     match issuer.current_keyset() {
         Ok(k) => {
@@ -525,21 +525,21 @@ pub fn issue(
         // set, so a set that has only been rotated to previous still works):
         // drop it, read the current one, re-blind the group's ESP outputs for
         // it and try once more (nothing was burned by the refusal).
-        if let TransferOutcome::Refused { code, .. } = &outcome {
-            if code == sp_wire::codes::KEYSET_RETIRED {
-                issues.esp_keyset = None;
-                if let Ok(fresh) = esp_keyset(issues, issuer, ctx) {
-                    if fresh != pending.groups[g].transfer.keyset {
-                        pending.groups[g] =
-                            build_transfer(&pending.request.groups[g], ctx.service_keypair, &fresh);
-                        issues
-                            .data
-                            .entries
-                            .insert(hash.clone(), Entry::Pending(Box::new(pending.clone())));
-                        issues.save().map_err(internal)?;
-                        outcome = send_transfer(issues, issuer, &mut pending, &hash, g);
-                    }
-                }
+        if let TransferOutcome::Refused { code, .. } = &outcome
+            && code == sp_wire::codes::KEYSET_RETIRED
+        {
+            issues.esp_keyset = None;
+            if let Ok(fresh) = esp_keyset(issues, issuer, ctx)
+                && fresh != pending.groups[g].transfer.keyset
+            {
+                pending.groups[g] =
+                    build_transfer(&pending.request.groups[g], ctx.service_keypair, &fresh);
+                issues
+                    .data
+                    .entries
+                    .insert(hash.clone(), Entry::Pending(Box::new(pending.clone())));
+                issues.save().map_err(internal)?;
+                outcome = send_transfer(issues, issuer, &mut pending, &hash, g);
             }
         }
         match outcome {
@@ -958,17 +958,17 @@ mod tests {
             save: crate::esp_client::Save,
         ) -> (TransferOutcome, Option<AirRequest>) {
             let _ = (kept, save);
-            if let Ok(k) = &*self.current.lock().unwrap() {
-                if *k != request.keyset {
-                    *self.refused.lock().unwrap() += 1;
-                    return (
-                        TransferOutcome::Refused {
-                            code: "keyset_retired".into(),
-                            why: "retired".into(),
-                        },
-                        None,
-                    );
-                }
+            if let Ok(k) = &*self.current.lock().unwrap()
+                && *k != request.keyset
+            {
+                *self.refused.lock().unwrap() += 1;
+                return (
+                    TransferOutcome::Refused {
+                        code: "keyset_retired".into(),
+                        why: "retired".into(),
+                    },
+                    None,
+                );
             }
             (
                 Script(Mutex::new(vec![]), Mutex::new(0)).answer(request),

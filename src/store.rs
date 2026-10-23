@@ -22,10 +22,10 @@ pub fn save<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
         f.sync_all()?;
     }
     fs::rename(&tmp, path)?;
-    if let Some(dir) = path.parent() {
-        if let Ok(d) = File::open(dir) {
-            let _ = d.sync_all();
-        }
+    if let Some(dir) = path.parent()
+        && let Ok(d) = File::open(dir)
+    {
+        let _ = d.sync_all();
     }
     Ok(())
 }

@@ -111,7 +111,7 @@ pub fn start_esp_listening(
         timeout_secs: 10,
         state_dir: dir.to_path_buf(),
     };
-    let key = key.clone();
+    let key = *key;
     spawn_listener(move |stop, runtime| {
         runtime.block_on(esp_mint::air_listener::run(&settings, &key, &serve, stop))
     })
@@ -130,7 +130,7 @@ pub fn start_listening(
         timeout_secs: 10,
         state_dir: dir.to_path_buf(),
     };
-    let key = key.clone();
+    let key = *key;
     spawn_listener(move |stop, runtime| {
         runtime.block_on(fsp_mint::air_listener::run(&settings, &key, &serve, stop))
     })

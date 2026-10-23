@@ -116,7 +116,7 @@ pub fn keys_outcome(s: &FspState) -> Outcome {
                     .iter()
                     .map(|k| (k.id.clone(), k.public.clone()))
                     .collect(),
-                next_rotation: next_rotation(&s, now),
+                next_rotation: next_rotation(s, now),
             };
             (
                 StatusCode::OK,
@@ -217,16 +217,13 @@ pub fn run_issue(s: &FspState, request: &IssueRequest) -> Outcome {
             if r.groups
                 .iter()
                 .any(|g| matches!(g, crate::api::GroupResult::Issued { .. }))
+                && let Err(e) = s.spender.note_first_issue((s.clock)())
             {
-                if let Err(e) = s.spender.note_first_issue((s.clock)()) {
-                    return error(
-                        500,
-                        sp_wire::codes::INTERNAL,
-                        &format!(
-                            "could not record the first issue: {e}. Send the same request again"
-                        ),
-                    );
-                }
+                return error(
+                    500,
+                    sp_wire::codes::INTERNAL,
+                    &format!("could not record the first issue: {e}. Send the same request again"),
+                );
             }
             (StatusCode::OK, serde_json::to_value(r).unwrap_or_default())
         }
@@ -258,10 +255,10 @@ pub fn run_spend(s: &FspState, request: &SpendRequest) -> Outcome {
 /// and not as a refusal of the notes: only a `400` means "refused, nothing was
 /// spent".
 fn refused(status: StatusCode, mut body: Value) -> Served {
-    if status != StatusCode::BAD_REQUEST {
-        if let Some(object) = body.as_object_mut() {
-            object.insert("http_status".into(), json!(status.as_u16()));
-        }
+    if status != StatusCode::BAD_REQUEST
+        && let Some(object) = body.as_object_mut()
+    {
+        object.insert("http_status".into(), json!(status.as_u16()));
     }
     Served::Refused(serde_json::to_vec(&body).expect("a JSON value encodes"))
 }

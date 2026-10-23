@@ -464,10 +464,10 @@ impl Config {
                 self.esp_keyset_ttl_secs
             ));
         }
-        if !self.service_did.is_empty() {
-            if let Err(e) = ServiceDid::parse(&self.service_did) {
-                p.push(format!("service.did: {e}"));
-            }
+        if !self.service_did.is_empty()
+            && let Err(e) = ServiceDid::parse(&self.service_did)
+        {
+            p.push(format!("service.did: {e}"));
         }
         if self.issue_fee_per_byte > ISSUE_FEE_CAP {
             p.push(format!(
@@ -715,10 +715,10 @@ pub fn load(data_dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Loa
             }
         }
     }
-    if problems.is_empty() {
-        if let Err(l) = config.validate() {
-            problems.extend(l);
-        }
+    if problems.is_empty()
+        && let Err(l) = config.validate()
+    {
+        problems.extend(l);
     }
     if problems.is_empty() {
         Ok(Loaded {

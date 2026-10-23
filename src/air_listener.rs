@@ -273,7 +273,7 @@ async fn handle_fill(
 ) -> Result<(), String> {
     // On a blocking thread: an issue calls the ESP mint over AIR with its own
     // client, and a spend waits for its batch (see the module docs).
-    let (key, serve, sealed) = (key.clone(), Arc::clone(serve), sealed.to_vec());
+    let (key, serve, sealed) = (*key, Arc::clone(serve), sealed.to_vec());
     let answered = tokio::task::spawn_blocking(move || {
         answer_request(&key, &sealed, addr::now_secs(), &*serve)
     })
