@@ -20,10 +20,12 @@
 #![allow(dead_code)]
 
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use sp_wire::ServiceDid;
@@ -235,5 +237,56 @@ impl Air {
 
     pub fn post_json(&self, route: &str, body: &impl serde::Serialize) -> (u16, Value) {
         self.call(route, &serde_json::to_vec(body).unwrap())
+    }
+}
+
+/// A folder of its own for every call, even when two tests pick the same name
+/// (they did: "partial" twice, so one test deleted the other's folder while
+/// both ran in parallel). The counter makes a clash impossible.
+pub fn scratch(name: &str) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("fsp-flow-{}-{n}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// How long `fsp_run` waits for the program to end.
+const RUN_DEADLINE: Duration = Duration::from_secs(90);
+
+/// Run `fsp-mint` with `args` and exactly the environment `env` (plus the data
+/// folder `base`), and wait for it to end, polling for its end every 100 ms.
+/// A program that does not end within 90 s is killed and fails the test with
+/// what it had printed, so a `serve` that does not stop is a failure, not a
+/// hang.
+pub fn fsp_run(base: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_fsp-mint"))
+        .args(args)
+        .env_clear()
+        .env("FSP_DATA_DIR", base)
+        .envs(env.iter().copied())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let until = Instant::now() + RUN_DEADLINE;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() > until {
+            child.kill().unwrap();
+            let out = child.wait_with_output().unwrap();
+            panic!(
+                "`fsp-mint {}` did not stop within {} s; stdout: {}; stderr: {}",
+                args.join(" "),
+                RUN_DEADLINE.as_secs(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 }

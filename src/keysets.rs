@@ -122,44 +122,6 @@ impl Keyset {
     }
 }
 
-/// Days since 1970-01-01 for a UTC date `YYYY-MM-DD`.
-pub fn parse_date(text: &str) -> Result<u64, String> {
-    let bad = || format!("`{text}` is not a date: use YYYY-MM-DD");
-    let parts: Vec<&str> = text.trim().split('-').collect();
-    if parts.len() != 3 || parts[0].len() != 4 || parts[1].len() != 2 || parts[2].len() != 2 {
-        return Err(bad());
-    }
-    let y: i64 = parts[0].parse().map_err(|_| bad())?;
-    let m: i64 = parts[1].parse().map_err(|_| bad())?;
-    let d: i64 = parts[2].parse().map_err(|_| bad())?;
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let dim = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    if !(1970..=9999).contains(&y) || !(1..=12).contains(&m) || d < 1 || d > dim[(m - 1) as usize] {
-        return Err(bad());
-    }
-    // Days from civil (Howard Hinnant's algorithm).
-    let y2 = if m <= 2 { y - 1 } else { y };
-    let era = y2.div_euclid(400);
-    let yoe = y2 - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Ok((era * 146097 + doe - 719468) as u64)
-}
-
 /// The rotation settings, in seconds. Rotation is off while `activation_secs`
 /// is 0 or no FSP has been issued yet. The first rollover is `activation_secs`
 /// after the first issue, then one every `period_secs`.
@@ -418,9 +380,12 @@ mod tests {
         assert_eq!(record_first_issue(&d, 900).unwrap(), 500, "never changed");
         assert_eq!(load_first_issue(&d).unwrap(), Some(500));
         std::fs::write(d.join(FIRST_ISSUE_FILE), "junk").unwrap();
+        let e = load_first_issue(&d).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::Other);
+        let shown = d.join(FIRST_ISSUE_FILE).display().to_string();
         assert!(
-            load_first_issue(&d).is_err(),
-            "a damaged record is an error"
+            e.to_string().starts_with(&format!("{shown} is damaged: ")),
+            "a damaged record is an error that names the file: {e}"
         );
         std::fs::remove_dir_all(&d).unwrap();
     }

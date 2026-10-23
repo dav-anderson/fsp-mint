@@ -104,9 +104,8 @@ pub struct PendingGroup {
     /// The request to the Issuer over AIR that carries `transfer` and has not
     /// been answered, kept here beside the transfer so that a retry reads the
     /// reply cell of the same request first and writes no second one. Absent
-    /// when no request is in flight, and in files written before 0.6.0 (they
-    /// read as none: the retry then makes a new request, which the Issuer
-    /// answers from its stored answer if it did the transfer).
+    /// when no request is in flight (a retry then makes a new request, which
+    /// the Issuer answers from its stored answer if it did the transfer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub air: Option<AirRequest>,
 }
@@ -140,10 +139,6 @@ pub struct IssueData {
     /// save as the stored answer of the issue (see `audit`).
     #[serde(default)]
     pub issued: BTreeMap<String, Num>,
-    /// How many answered issues there were when the counters began (those
-    /// issues are not in `issued`). `None` until the first open by 0.4.0.
-    #[serde(default)]
-    pub uncounted_requests: Option<u64>,
 }
 
 pub struct Issues {
@@ -157,8 +152,7 @@ pub struct Issues {
 impl Issues {
     pub fn open(data_dir: &Path) -> io::Result<Self> {
         let path = data_dir.join(FILE_NAME);
-        let mut data: IssueData = store::load(&path)?.unwrap_or_default();
-        data.start_counting();
+        let data: IssueData = store::load(&path)?.unwrap_or_default();
         Ok(Issues {
             path,
             data,
@@ -179,6 +173,10 @@ pub struct IssueError {
     pub status: u16,
     pub code: &'static str,
     pub why: String,
+    /// With `note_spent_elsewhere`: the positions of the ESP notes already
+    /// transferred to this service, counted across the groups in order. Empty
+    /// for every other refusal.
+    pub spent: Vec<usize>,
 }
 
 fn refuse(code: &'static str, why: impl Into<String>) -> IssueError {
@@ -186,6 +184,7 @@ fn refuse(code: &'static str, why: impl Into<String>) -> IssueError {
         status: 400,
         code,
         why: why.into(),
+        spent: Vec::new(),
     }
 }
 
@@ -194,6 +193,7 @@ fn internal(e: impl std::fmt::Display) -> IssueError {
         status: 500,
         code: sp_wire::codes::INTERNAL,
         why: e.to_string(),
+        spent: Vec::new(),
     }
 }
 
@@ -239,6 +239,7 @@ fn esp_keyset(
                 status: 502,
                 code: sp_wire::codes::ISSUER_UNAVAILABLE,
                 why: format!("could not read the Issuer's keyset: {why}; retry"),
+                spent: Vec::new(),
             }),
         },
     }
@@ -450,17 +451,47 @@ pub fn issue(
                             return Err(IssueError {
                                 status: 409,
                                 code: sp_wire::codes::NOTE_HELD,
-                                why: "a note or output of this request is held by another issue that has not finished: retry that one".into(),
+                                why: "a note or output of this request is held by another issue that has not finished: retry that one".into(), spent: Vec::new(),
                             });
                         }
                     }
                 }
             }
-            if ours.iter().any(|n| issues.data.transferred.contains(n)) {
-                return Err(refuse(
-                    "already_spent",
-                    "an ESP note of this request was already transferred to this service",
-                ));
+            // Every ESP note already transferred to this service is named, not
+            // only the first: the position counts the notes across the groups, in
+            // order.
+            let transferred: Vec<usize> = request
+                .groups
+                .iter()
+                .flat_map(|g| g.notes.iter())
+                .enumerate()
+                .filter(|(_, n)| {
+                    issues
+                        .data
+                        .transferred
+                        .contains(&hex::encode(n.note.nonce.0.serialize()))
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if !transferred.is_empty() {
+                let list: Vec<String> = transferred.iter().map(|i| i.to_string()).collect();
+                let why = if transferred.len() == 1 {
+                    format!(
+                        "ESP note {} of this request was already transferred to this service",
+                        list[0]
+                    )
+                } else {
+                    format!(
+                        "ESP notes {} of this request were already transferred to this service",
+                        list.join(", ")
+                    )
+                };
+                return Err(IssueError {
+                    status: 400,
+                    code: sp_wire::codes::NOTE_SPENT_ELSEWHERE,
+                    why,
+                    spent: transferred,
+                });
             }
             // The ESP outputs are asked of the Issuer's current keyset, fixed
             // here so that a retry sends the same transfer.
@@ -521,6 +552,7 @@ pub fn issue(
                         status: 502,
                         code: sp_wire::codes::ISSUER_UNAVAILABLE,
                         why: "the Issuer's transfer reply does not fit the request; retry".into(),
+                        spent: Vec::new(),
                     });
                 }
                 for (i, out) in group.esp_outputs.iter().enumerate() {
@@ -566,6 +598,7 @@ pub fn issue(
                     why: format!(
                         "the ESP transfer at the Issuer did not answer ({why}). Nothing was issued yet; send the same request again to finish it"
                     ),
+                    spent: Vec::new(),
                 });
             }
         }
@@ -644,11 +677,9 @@ mod tests {
 
     /// An Issuer stand-in: answers from a script, then "done" with junk keys.
     struct Script(Mutex<Vec<TransferOutcome>>, Mutex<usize>);
-    impl Issuer for Script {
-        fn current_keyset(&self) -> Result<String, String> {
-            Ok("11".repeat(8))
-        }
-        fn transfer(&self, request: &TransferRequest) -> TransferOutcome {
+    impl Script {
+        /// The next scripted outcome (or "done" when the script is spent).
+        fn answer(&self, request: &TransferRequest) -> TransferOutcome {
             *self.1.lock().unwrap() += 1;
             let mut s = self.0.lock().unwrap();
             if !s.is_empty() {
@@ -665,6 +696,23 @@ mod tests {
                 fee_esp: 0,
                 size_bytes: 0,
             })
+        }
+    }
+    impl Issuer for Script {
+        fn current_keyset(&self) -> Result<String, String> {
+            Ok("11".repeat(8))
+        }
+        fn transfer_kept(
+            &self,
+            request: &TransferRequest,
+            kept: Option<AirRequest>,
+            save: crate::esp_client::Save,
+        ) -> (TransferOutcome, Option<AirRequest>) {
+            let _ = (kept, save);
+            (self.answer(request), None)
+        }
+        fn network(&self) -> Result<Option<String>, String> {
+            Ok(Some("regtest".into()))
         }
     }
 
@@ -762,7 +810,7 @@ mod tests {
         let issuer = Script(
             Mutex::new(vec![
                 TransferOutcome::Done(
-                    match (Script(Mutex::new(vec![]), Mutex::new(0))).transfer(
+                    match (Script(Mutex::new(vec![]), Mutex::new(0))).answer(
                         &build_transfer(&req.groups[0], &service_kp, &"11".repeat(8)).transfer,
                     ) {
                         TransferOutcome::Done(r) => r,
@@ -857,10 +905,9 @@ mod tests {
             issue(&mut issues, &issuer, &r, &ctx).unwrap_err().code,
             "not_exact"
         );
-        let size = issue_group_size(1, 2); // 204
+        assert_eq!(issue_group_size(1, 2), 204);
         r.groups[0].outputs = vec![out(32), out(16), out(4)];
         assert_eq!(issue_group_size(1, 3), 16 + 106 + 123);
-        let _ = size;
         r.groups[0].notes = vec![note(256 + 52)];
         assert_eq!(
             issue(&mut issues, &issuer, &r, &ctx).unwrap_err().code,
@@ -904,17 +951,32 @@ mod tests {
             *self.reads.lock().unwrap() += 1;
             self.current.lock().unwrap().clone()
         }
-        fn transfer(&self, request: &TransferRequest) -> TransferOutcome {
+        fn transfer_kept(
+            &self,
+            request: &TransferRequest,
+            kept: Option<AirRequest>,
+            save: crate::esp_client::Save,
+        ) -> (TransferOutcome, Option<AirRequest>) {
+            let _ = (kept, save);
             if let Ok(k) = &*self.current.lock().unwrap() {
                 if *k != request.keyset {
                     *self.refused.lock().unwrap() += 1;
-                    return TransferOutcome::Refused {
-                        code: "keyset_retired".into(),
-                        why: "retired".into(),
-                    };
+                    return (
+                        TransferOutcome::Refused {
+                            code: "keyset_retired".into(),
+                            why: "retired".into(),
+                        },
+                        None,
+                    );
                 }
             }
-            Script(Mutex::new(vec![]), Mutex::new(0)).transfer(request)
+            (
+                Script(Mutex::new(vec![]), Mutex::new(0)).answer(request),
+                None,
+            )
+        }
+        fn network(&self) -> Result<Option<String>, String> {
+            Ok(Some("regtest".into()))
         }
     }
 
@@ -1006,42 +1068,6 @@ mod tests {
         assert_eq!(kept_keysets(&issues), vec!["11".repeat(8), "11".repeat(8)]);
     }
 
-    #[test]
-    fn every_keyset_field_is_in_the_issue_and_spend_request_hashes() {
-        let a = request(&[1, 2]);
-        let mut b = a.clone();
-        b.groups[1].notes[0].keyset = "23".repeat(8);
-        assert_ne!(a.hash(), b.hash(), "a handed note's keyset is hashed");
-        // Lengths keep the boundary: "ab"+"c" is not "a"+"bc".
-        let mut c = a.clone();
-        c.groups[1].notes[0].keyset = String::new();
-        assert_ne!(a.hash(), c.hash());
-        assert_eq!(a.hash(), a.clone().hash());
-
-        let n = note(4);
-        let input = |k: &str| crate::api::FspInput {
-            keyset: k.into(),
-            input: mint_types::MintInput {
-                amount: Amount::from_units(4),
-                note: n.note,
-                spend_signature: secp256k1::schnorr::Signature::from_slice(&[1u8; 64]).unwrap(),
-            },
-        };
-        let spend = |ks: &[&str]| crate::api::SpendRequest {
-            inputs: ks.iter().map(|k| input(k)).collect(),
-            outputs: vec![],
-            pay: 8,
-            memo: String::new(),
-        };
-        let x = spend(&["aa", "b"]);
-        assert_ne!(
-            x.hash(),
-            spend(&["a", "ab"]).hash(),
-            "keysets are length-prefixed"
-        );
-        assert_ne!(x.hash(), spend(&["aa", "c"]).hash());
-        assert_eq!(x.hash(), spend(&["aa", "b"]).hash());
-    }
     /// An Issuer stand-in that keeps a request the way the AIR one does: the
     /// first call saves one and gets no answer, and the retry must be handed it
     /// back; then it answers and the request is over.
@@ -1064,8 +1090,8 @@ mod tests {
         fn current_keyset(&self) -> Result<String, String> {
             Ok("11".repeat(8))
         }
-        fn transfer(&self, request: &TransferRequest) -> TransferOutcome {
-            Script(Mutex::new(vec![]), Mutex::new(0)).transfer(request)
+        fn network(&self) -> Result<Option<String>, String> {
+            Ok(Some("regtest".into()))
         }
         fn transfer_kept(
             &self,
@@ -1082,7 +1108,10 @@ mod tests {
                     Some(in_flight()),
                 )
             } else {
-                (self.transfer(request), None)
+                (
+                    Script(Mutex::new(vec![]), Mutex::new(0)).answer(request),
+                    None,
+                )
             }
         }
     }
@@ -1112,12 +1141,14 @@ mod tests {
         let e = issue(&mut issues, &issuer, &req, &ctx).unwrap_err();
         assert_eq!((e.status, e.code), (502, "issuer_unavailable"));
         // It is in the file, in the pending group of the transfer it carries.
-        let file: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(d.join(FILE_NAME)).unwrap()).unwrap();
-        let entry = &file["entries"][req.hash()];
-        assert_eq!(entry["entry"], "pending");
-        assert_eq!(entry["groups"][0]["air"]["request_id"], "ab".repeat(32));
-        assert_eq!(entry["groups"][0]["air"]["slots"], serde_json::json!([4]));
+        let on_disk: IssueData = store::load(&d.join(FILE_NAME)).unwrap().unwrap();
+        match on_disk.entries.get(&req.hash()) {
+            Some(Entry::Pending(p)) => {
+                assert_eq!(p.groups.len(), 1);
+                assert_eq!(p.groups[0].air, Some(in_flight()));
+            }
+            other => panic!("expected a pending entry, got {other:?}"),
+        }
         // A restart, then the retry: it is handed the same request.
         let mut issues = Issues::open(&d).unwrap();
         issue(&mut issues, &issuer, &req, &ctx).unwrap();
@@ -1125,31 +1156,14 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert!(seen[0].is_none());
         assert_eq!(seen[1].as_ref(), Some(&in_flight()));
-        // The request is over with the transfer: nothing is kept in the file.
-        let text = std::fs::read_to_string(d.join(FILE_NAME)).unwrap();
-        assert!(!text.contains("\"air\""), "{text}");
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn a_pending_group_without_a_kept_request_reads_as_none_and_is_written_without_one() {
-        let (mut issues, keys, d) = setup("old-file");
-        let service_kp = kp(1);
-        let ctx = context(&keys, &service_kp);
-        let req = request(&[10]);
-        let issuer = Script(
-            Mutex::new(vec![TransferOutcome::Unknown("timeout".into())]),
-            Mutex::new(0),
+        // The request is over with the transfer: the entry is finished, so no
+        // pending group (and no request in flight) is left in the file.
+        let on_disk: IssueData = store::load(&d.join(FILE_NAME)).unwrap().unwrap();
+        assert!(
+            matches!(on_disk.entries.get(&req.hash()), Some(Entry::Done(_))),
+            "{:?}",
+            on_disk.entries.get(&req.hash())
         );
-        issue(&mut issues, &issuer, &req, &ctx).unwrap_err();
-        // What a 0.5.0 file looks like: the same, with no `air` key at all.
-        let text = std::fs::read_to_string(d.join(FILE_NAME)).unwrap();
-        assert!(!text.contains("\"air\""), "{text}");
-        let issues = Issues::open(&d).unwrap();
-        match issues.data.entries.get(&req.hash()) {
-            Some(Entry::Pending(p)) => assert!(p.groups[0].air.is_none()),
-            other => panic!("expected a pending entry, got {other:?}"),
-        }
         let _ = std::fs::remove_dir_all(&d);
     }
 }

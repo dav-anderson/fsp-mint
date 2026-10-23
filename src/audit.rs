@@ -26,10 +26,8 @@
 //! `export-esp` is still in the figures, and is also shown as `exported_esp`:
 //! the mint cannot tell whether the service's wallet has redeemed it yet.
 //!
-//! **Not counted.** Issues and spends answered by a version before 0.4.0 did
-//! not record their amounts, so they cannot be counted. The report says how
-//! many (`complete: false`, and a warning). Dollar figures are not here: they
-//! need a payout rate, which this mint does not hold (see `spi`).
+//! Dollar figures are not here: they need a payout rate, which this mint does
+//! not hold (see `spi`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -39,7 +37,7 @@ use std::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sp_wire::units::ESP_PER_PSP;
 
-use crate::issue::{self, Entry, IssueData, KeptEsp};
+use crate::issue::{self, IssueData, KeptEsp};
 use crate::store;
 
 pub const LEDGER_FILE: &str = "ledger.json";
@@ -88,9 +86,6 @@ pub struct Counters {
     /// FSP of notes of this key set used up by spends.
     #[serde(default)]
     pub spent: Num,
-    /// Spends in the log that carry no amounts (written before 0.4.0).
-    #[serde(default)]
-    pub uncounted_spends: u64,
 }
 
 /// The counters of key sets that have been deleted, copied before their logs
@@ -204,8 +199,6 @@ pub struct Report {
     pub today: u64,
     pub fsp: FspAudit,
     pub esp_reserve: EspReserve,
-    /// False when some issues or spends could not be counted (see `warnings`).
-    pub complete: bool,
     /// False when a key set has spent more than it issued and received.
     pub consistent: bool,
     pub warnings: Vec<String>,
@@ -289,7 +282,7 @@ pub fn build(now: u64, view: &SpendView, issues: &IssueData) -> Report {
     let mut lines = Vec::new();
     let (mut outstanding, mut expired) = (0i128, 0i128);
     let (mut issued_all, mut spent_all, mut change_all) = (0i128, 0i128, 0i128);
-    let (mut uncounted_spends, mut consistent) = (0u64, true);
+    let mut consistent = true;
     for (id, live) in ids {
         let c = if live {
             view.counters.get(&id).copied().unwrap_or_default()
@@ -299,7 +292,6 @@ pub fn build(now: u64, view: &SpendView, issues: &IssueData) -> Report {
         let issued = issues.issued.get(&id).copied().unwrap_or_default().0;
         let net = issued + c.change.0 - c.spent.0;
         consistent &= net >= 0;
-        uncounted_spends += c.uncounted_spends;
         issued_all += issued;
         change_all += c.change.0;
         spent_all += c.spent.0;
@@ -318,18 +310,7 @@ pub fn build(now: u64, view: &SpendView, issues: &IssueData) -> Report {
         });
     }
 
-    let uncounted_requests = issues.uncounted_requests.unwrap_or(0);
     let mut warnings = Vec::new();
-    if uncounted_requests > 0 {
-        warnings.push(format!(
-            "{uncounted_requests} issue request(s) were answered before version 0.4.0 and did not record their amounts: their FSP is not in these figures"
-        ));
-    }
-    if uncounted_spends > 0 {
-        warnings.push(format!(
-            "{uncounted_spends} spend(s) were answered before version 0.4.0 and did not record their amounts: they are not in these figures"
-        ));
-    }
     if !consistent {
         warnings.push(
             "a key set has spent more than it issued and received as change: this is a fault to look into, not a rounding"
@@ -349,7 +330,6 @@ pub fn build(now: u64, view: &SpendView, issues: &IssueData) -> Report {
             expired: amount(expired),
         },
         esp_reserve: reserve(&issues.kept, today),
-        complete: uncounted_requests == 0 && uncounted_spends == 0,
         consistent,
         warnings,
     }
@@ -361,8 +341,7 @@ pub fn build(now: u64, view: &SpendView, issues: &IssueData) -> Report {
 /// wrote them: one that is due to retire is still shown live until the mint
 /// next runs.
 pub fn from_dir(dir: &Path, now: u64) -> io::Result<Report> {
-    let mut issues: IssueData = store::load(&dir.join(issue::FILE_NAME))?.unwrap_or_default();
-    issues.start_counting();
+    let issues: IssueData = store::load(&dir.join(issue::FILE_NAME))?.unwrap_or_default();
     let ledger = Ledger::load(dir)?;
     let live: Vec<String> = if dir.join(crate::keysets::FILE_NAME).exists() {
         crate::keysets::Keysets::open(dir)?
@@ -389,21 +368,6 @@ pub fn from_dir(dir: &Path, now: u64) -> io::Result<Report> {
         }
     }
     Ok(build(now, &view, &issues))
-}
-
-impl IssueData {
-    /// Note, once, how many answered issues there are that were never counted
-    /// (they predate the counters). Later issues are counted as they finish.
-    pub fn start_counting(&mut self) {
-        if self.uncounted_requests.is_none() {
-            let done = self
-                .entries
-                .values()
-                .filter(|e| matches!(e, Entry::Done(_)))
-                .count();
-            self.uncounted_requests = Some(done as u64);
-        }
-    }
 }
 
 #[cfg(test)]

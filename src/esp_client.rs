@@ -57,33 +57,24 @@ pub struct AirRequest {
 pub type Save<'a> = &'a mut (dyn FnMut(&AirRequest) -> Result<(), String> + Send);
 
 pub trait Issuer: Send + Sync {
-    /// Send a transfer without keeping the request (a stand-in Issuer in a test
-    /// answers this; the real one overrides [`Issuer::transfer_kept`]).
-    fn transfer(&self, request: &TransferRequest) -> TransferOutcome;
     /// The Issuer's current keyset, which a new transfer names for its
     /// outputs. An error means the Issuer could not be asked.
     fn current_keyset(&self) -> Result<String, String>;
 
-    /// [`Issuer::transfer`] for a request that is kept: `kept` is the request in
-    /// flight from an earlier try (from the pending group), `save` is how a new
-    /// state of it is kept, and the second result is the request still in flight
-    /// afterwards (`None` when it ended: answered, refused, or its reply failed a
-    /// check). The default keeps nothing.
+    /// Send a transfer. `kept` is the request in flight from an earlier try
+    /// (from the pending group), `save` is how a new state of it is kept, and
+    /// the second result is the request still in flight afterwards (`None` when
+    /// it ended: answered, refused, or its reply failed a check).
     fn transfer_kept(
         &self,
         request: &TransferRequest,
         kept: Option<AirRequest>,
         save: Save,
-    ) -> (TransferOutcome, Option<AirRequest>) {
-        let _ = (kept, save);
-        (self.transfer(request), None)
-    }
+    ) -> (TransferOutcome, Option<AirRequest>);
 
     /// The network the Issuer reports in its mint info, if it says. An error
     /// means it could not be asked.
-    fn network(&self) -> Result<Option<String>, String> {
-        Err("this Issuer cannot report its network".into())
-    }
+    fn network(&self) -> Result<Option<String>, String>;
 
     /// Where the Issuer is, for messages: its DID and AIR server.
     fn describe(&self) -> String {

@@ -22,6 +22,52 @@ pub const FILE_ENV: &str = "FSP_CONFIG";
 /// `GET /fees`), never from this constant.
 pub const DEFAULT_MAX_ITEMS: usize = 1000;
 
+// ---- the caps ----------------------------------------------------------------
+//
+// Every size ceiling and every fee rate has a hard cap (and a ceiling a floor),
+// checked when the settings load, so that no setting can reach a value that
+// breaks the mint's own routes. The numbers and the reasoning are in DESIGN.md,
+// "Caps on sizes and fees"; the sums are checked at compile time below.
+
+/// The most `server.max_request_bytes` may be: 15 MiB, the largest message AIR
+/// carries (16 MiB) less 1 MiB kept for the envelope, its seal and AIR's framing.
+/// A higher ceiling would let the mint take a request that no wallet can send.
+pub const MAX_REQUEST_BYTES_CAP: u64 = 15 * 1024 * 1024;
+/// The least `server.max_request_bytes` may be: 16 KiB. The widest one-note
+/// request is a spend with one note, 64 change outputs (the most one amount
+/// needs: a `u64` splits into at most 64 powers of two) and the longest memo
+/// (1024 bytes) made of characters that JSON escapes to six: 13,951 bytes.
+pub const MIN_REQUEST_BYTES: u64 = 16 * 1024;
+/// The least `issue.max_items` and `spend.max_items` may be: the outputs one
+/// amount can need, so that a one-note request is never over the count.
+pub const MIN_ITEMS: u64 = 64;
+/// The most `issue.max_items` and `spend.max_items` may be: 25,000. A note and an
+/// output in a spend are 501 bytes together in JSON (the widest pair), so a spend
+/// of that many is 12.5 MB, which fits [`MAX_REQUEST_BYTES_CAP`]; a higher count
+/// could not.
+pub const MAX_ITEMS_CAP: u64 = 25_000;
+/// The most `spend.max_memo_bytes` may be: 1024.
+pub const MAX_MEMO_BYTES_CAP: u64 = 1024;
+/// The smallest note a fee is held against: 1 PSP of ESP, 10^11 units ($0.10), as
+/// in esp-mint. Smaller ESP notes exist only as the pieces of a larger amount.
+pub const SMALLEST_NOTE_ESP: u64 = 100_000_000_000;
+/// The most `fees.issue_fee_per_byte` may be: 30,000,000 units a byte, which
+/// makes the worst one-note issue group (2,746 canonical bytes) cost 82.4 billion
+/// units, under the smallest note.
+pub const ISSUE_FEE_CAP: u64 = 30_000_000;
+
+const _: () = {
+    // the worst one-note issue group, in canonical bytes: 16 + one note (106) and
+    // the most outputs one amount can need (64 at 41)
+    let issue_worst = 16 + 106 + MIN_ITEMS * 41;
+    assert!(ISSUE_FEE_CAP * issue_worst <= SMALLEST_NOTE_ESP);
+    // a spend of the most items, plus the longest memo escaped to six bytes a
+    // character, fits the largest ceiling
+    assert!(MAX_ITEMS_CAP * 501 + 6 * MAX_MEMO_BYTES_CAP < MAX_REQUEST_BYTES_CAP);
+    // the widest one-note spend (8,063 with a 256-byte memo, memo bytes at six)
+    assert!(MIN_REQUEST_BYTES >= 8_063 - 256 + 6 * MAX_MEMO_BYTES_CAP);
+};
+
 /// Settings that were taken out, with the environment variable each had and what
 /// replaces it. A file or an environment that still names one is refused with this
 /// text, not with "unknown setting".
@@ -66,7 +112,7 @@ pub const SPECS: &[Spec] = &[
         env: "FSP_MAX_REQUEST_BYTES",
         default: "1048576",
         units: "bytes",
-        what: "Ceiling on a request body (an issue or a spend, as the AIR listener reads it), as on the other mints. Over it: a signed refusal with the 413 body, before anything is parsed. 4096 to 1 GiB.",
+        what: "Ceiling on a request body (an issue or a spend, as the AIR listener reads it), as on the other mints. Over it: a signed refusal with the 413 body, before anything is parsed. 16384 to 15728640 (15 MiB: the most one AIR message carries).",
     },
     Spec {
         key: "service.did",
@@ -80,7 +126,7 @@ pub const SPECS: &[Spec] = &[
         env: "FSP_ISSUE_FEE_PER_BYTE",
         default: "0",
         units: "units/byte",
-        what: "The ESP to FSP fee: FSP units per byte of each group's canonical size (16 + 106 a note + 41 an output), taken from the group's ESP. 0 to 10^12.",
+        what: "The ESP to FSP fee: FSP units per byte of each group's canonical size (16 + 106 a note + 41 an output), taken from the group's ESP. 0 to 30000000: the cap keeps the worst one-note group (2,746 bytes) under the value of the smallest note (1 PSP, 10^11 units).",
     },
     Spec {
         key: "rotation.activation_hours",
@@ -101,21 +147,21 @@ pub const SPECS: &[Spec] = &[
         env: "FSP_ISSUE_MAX_ITEMS",
         default: "1000",
         units: "notes",
-        what: "The most groups in one issue request, and the most ESP notes and the most FSP outputs in one group. More is refused 400 too_many_items before anything is spent. The wallet reads it from the fees call. 1 to 100000.",
+        what: "The most groups in one issue request, and the most ESP notes and the most FSP outputs in one group. More is refused 400 too_many_items before anything is spent. The wallet reads it from the fees call. 64 to 25000: at least the 64 outputs one amount can need, at most what fits one AIR message.",
     },
     Spec {
         key: "spend.max_items",
         env: "FSP_SPEND_MAX_ITEMS",
         default: "1000",
         units: "notes",
-        what: "The most notes in, and the most outputs, in one spend. More is refused 400 too_many_items. The wallet reads it from the fees call. 1 to 100000.",
+        what: "The most notes in, and the most outputs, in one spend. More is refused 400 too_many_items. The wallet reads it from the fees call. 64 to 25000, as for issue.max_items.",
     },
     Spec {
         key: "spend.max_memo_bytes",
         env: "FSP_SPEND_MAX_MEMO_BYTES",
         default: "256",
         units: "bytes",
-        what: "The longest memo on a spend. A longer one is refused 400 memo_too_long before anything is spent. The wallet reads it from the fees call. 0 to 65536.",
+        what: "The longest memo on a spend. A longer one is refused 400 memo_too_long before anything is spent. The wallet reads it from the fees call. 0 to 1024.",
     },
     Spec {
         key: "spend.max_batch",
@@ -406,9 +452,9 @@ impl Config {
             )),
             Ok(_) => {}
         }
-        if !(4096..=1 << 30).contains(&self.max_request_bytes) {
+        if !(MIN_REQUEST_BYTES..=MAX_REQUEST_BYTES_CAP).contains(&self.max_request_bytes) {
             p.push(format!(
-                "server.max_request_bytes = {} must be 4096 to 1073741824 bytes",
+                "server.max_request_bytes = {} must be {MIN_REQUEST_BYTES} to {MAX_REQUEST_BYTES_CAP} bytes (a one-note request with 64 outputs has to fit, and 15 MiB is the most one AIR message carries)",
                 self.max_request_bytes
             ));
         }
@@ -423,9 +469,9 @@ impl Config {
                 p.push(format!("service.did: {e}"));
             }
         }
-        if self.issue_fee_per_byte > 1_000_000_000_000 {
+        if self.issue_fee_per_byte > ISSUE_FEE_CAP {
             p.push(format!(
-                "fees.issue_fee_per_byte = {} must be 0 to 10^12",
+                "fees.issue_fee_per_byte = {} must be 0 to {ISSUE_FEE_CAP} (the cap keeps the worst one-note issue group under the value of the smallest note, 1 PSP, 10^11 units)",
                 self.issue_fee_per_byte
             ));
         }
@@ -447,21 +493,21 @@ impl Config {
                 self.spend_max_batch
             ));
         }
-        if !(1..=100_000).contains(&self.issue_max_items) {
+        if !(MIN_ITEMS..=MAX_ITEMS_CAP).contains(&self.issue_max_items) {
             p.push(format!(
-                "issue.max_items = {} must be 1 to 100000",
+                "issue.max_items = {} must be {MIN_ITEMS} to {MAX_ITEMS_CAP} (at least the 64 outputs one amount can need, and at most what fits one AIR message)",
                 self.issue_max_items
             ));
         }
-        if !(1..=100_000).contains(&self.spend_max_items) {
+        if !(MIN_ITEMS..=MAX_ITEMS_CAP).contains(&self.spend_max_items) {
             p.push(format!(
-                "spend.max_items = {} must be 1 to 100000",
+                "spend.max_items = {} must be {MIN_ITEMS} to {MAX_ITEMS_CAP} (at least the 64 outputs one amount can need, and at most what fits one AIR message)",
                 self.spend_max_items
             ));
         }
-        if self.spend_max_memo_bytes > 65_536 {
+        if self.spend_max_memo_bytes > MAX_MEMO_BYTES_CAP {
             p.push(format!(
-                "spend.max_memo_bytes = {} must be 0 to 65536",
+                "spend.max_memo_bytes = {} must be 0 to {MAX_MEMO_BYTES_CAP} (the request ceiling's floor is sized for it)",
                 self.spend_max_memo_bytes
             ));
         }
@@ -833,11 +879,11 @@ mod tests {
     #[test]
     fn the_note_limits_come_from_the_settings() {
         let d = dir("items");
-        fs::write(d.join(FILE_NAME), "[issue]\nmax_items = 50\n").unwrap();
-        let env = |n: &str| (n == "FSP_SPEND_MAX_ITEMS").then(|| "20".to_string());
+        fs::write(d.join(FILE_NAME), "[issue]\nmax_items = 100\n").unwrap();
+        let env = |n: &str| (n == "FSP_SPEND_MAX_ITEMS").then(|| "200".to_string());
         let l = load(&d, &env).unwrap();
-        assert_eq!(l.config.issue_max_items, 50);
-        assert_eq!(l.config.spend_max_items, 20);
+        assert_eq!(l.config.issue_max_items, 100);
+        assert_eq!(l.config.spend_max_items, 200);
         assert_eq!(Config::default().spend_max_memo_bytes, 256);
         let memo = |n: &str| (n == "FSP_SPEND_MAX_MEMO_BYTES").then(|| "1024".to_string());
         assert_eq!(load(&d, &memo).unwrap().config.spend_max_memo_bytes, 1024);
@@ -928,62 +974,6 @@ mod tests {
     }
 
     #[test]
-    fn serve_needs_all_five_air_settings_and_names_each_missing_one() {
-        let c = Config::default();
-        let e = c.require_air().unwrap_err();
-        for name in [
-            "air.esp_did",
-            "air.esp_server",
-            "air.esp_host",
-            "air.server",
-            "air.host",
-        ] {
-            assert!(e.contains(name), "{e}");
-        }
-        let mut c = Config::default();
-        c.set("air.esp_did", ESP_DID).unwrap();
-        c.set("air.esp_host", "127.0.0.1").unwrap();
-        c.set("air.server", ESP_DID).unwrap();
-        c.set("air.host", "127.0.0.1").unwrap();
-        let e = c.require_air().unwrap_err();
-        assert!(e.contains("FSP_AIR_ESP_SERVER"), "{e}");
-        assert!(
-            !e.contains("FSP_AIR_ESP_HOST")
-                && !e.contains("FSP_AIR_ESP_DID")
-                && !e.contains("(FSP_AIR_SERVER)")
-                && !e.contains("(FSP_AIR_HOST)"),
-            "{e}"
-        );
-        assert!(e.contains("is not set"), "{e}");
-        c.set("air.esp_server", ESP_DID).unwrap();
-        assert!(c.require_air().is_ok());
-        // The listener's own server and host are the ones the listener uses.
-        let l = c.air_listener(std::path::Path::new("/x"));
-        assert_eq!((l.server.host.as_str(), l.held_reads), ("127.0.0.1", 16));
-        c.set("air.esp_host", "10.0.0.9").unwrap();
-        assert_eq!(
-            c.air_listener(std::path::Path::new("/x")).server.host,
-            "127.0.0.1"
-        );
-    }
-
-    #[test]
-    fn server_bind_must_be_a_loopback_address() {
-        let mut c = Config::default();
-        c.set("server.bind", "0.0.0.0:3200").unwrap();
-        let p = c.validate().unwrap_err();
-        assert!(
-            p.iter()
-                .any(|x| x.contains("server.bind") && x.contains("not a loopback address")),
-            "{p:?}"
-        );
-        c.set("server.bind", "[::1]:3200").unwrap();
-        assert!(c.validate().is_ok());
-        c.set("server.bind", "127.0.0.1:3200").unwrap();
-        assert!(c.validate().is_ok());
-    }
-
-    #[test]
     fn the_removed_esp_settings_get_a_clear_error() {
         let d = dir("removed");
         fs::write(
@@ -1045,9 +1035,60 @@ mod tests {
         assert!(load(&dir("net"), &env).unwrap_err()[0].contains("not a network"));
         assert!(p.iter().any(|x| x.contains("FSP_AIR_ATTEMPTS")), "{p:?}");
         let env = |n: &str| (n == "FSP_MAX_REQUEST_BYTES").then(|| "10".to_string());
-        assert!(load(&dir("range"), &env).unwrap_err()[0].contains("4096"));
+        assert!(load(&dir("range"), &env).unwrap_err()[0].contains("16384"));
         let env = |n: &str| (n == FILE_ENV).then(|| "/nonexistent/fsp.toml".to_string());
-        assert!(load(&d, &env).is_err());
+        let p = load(&d, &env).unwrap_err();
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(
+            p[0].starts_with("cannot read config file /nonexistent/fsp.toml: "),
+            "{p:?}"
+        );
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A settings file that sets `key` (`section.name`) to `value` is refused at
+    /// load, and the message names the setting, the value and the range.
+    fn refused_at_load(key: &str, value: u64, range: &str) {
+        let (section, name) = key.split_once('.').unwrap();
+        let d = dir(&format!("cap-{section}-{name}-{value}"));
+        fs::write(
+            d.join(FILE_NAME),
+            format!("[{section}]\n{name} = {value}\n"),
+        )
+        .unwrap();
+        let env = |_: &str| None;
+        let p = load(&d, &env).unwrap_err();
+        let want = format!("{key} = {value} must be {range} ");
+        assert!(p.iter().any(|x| x.starts_with(&want)), "{p:?}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn max_request_bytes_past_its_cap_is_refused_at_load() {
+        // above what one AIR message carries, and below a one-note request
+        refused_at_load("server.max_request_bytes", 15_728_641, "16384 to 15728640");
+        refused_at_load("server.max_request_bytes", 16_383, "16384 to 15728640");
+    }
+
+    #[test]
+    fn issue_max_items_past_its_cap_is_refused_at_load() {
+        refused_at_load("issue.max_items", 25_001, "64 to 25000");
+        refused_at_load("issue.max_items", 63, "64 to 25000");
+    }
+
+    #[test]
+    fn spend_max_items_past_its_cap_is_refused_at_load() {
+        refused_at_load("spend.max_items", 25_001, "64 to 25000");
+        refused_at_load("spend.max_items", 63, "64 to 25000");
+    }
+
+    #[test]
+    fn spend_max_memo_bytes_past_its_cap_is_refused_at_load() {
+        refused_at_load("spend.max_memo_bytes", 1_025, "0 to 1024");
+    }
+
+    #[test]
+    fn issue_fee_per_byte_past_its_cap_is_refused_at_load() {
+        refused_at_load("fees.issue_fee_per_byte", 30_000_001, "0 to 30000000");
     }
 }

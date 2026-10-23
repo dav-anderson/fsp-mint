@@ -151,11 +151,6 @@ impl AirIssuer {
 }
 
 impl Issuer for AirIssuer {
-    fn transfer(&self, request: &TransferRequest) -> TransferOutcome {
-        self.transfer_kept(request, None, &mut |_: &AirRequest| Ok(()))
-            .0
-    }
-
     fn transfer_kept(
         &self,
         request: &TransferRequest,

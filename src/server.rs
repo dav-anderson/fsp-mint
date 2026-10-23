@@ -49,6 +49,17 @@ fn error(status: u16, code: &str, why: &str) -> Outcome {
     )
 }
 
+/// [`error`] for a refusal that names notes: `note_spent_elsewhere` carries
+/// `spent`, the positions of every input that is spent, which the wallet reads
+/// to stop offering those notes.
+fn error_naming(status: u16, code: &str, why: &str, spent: &[usize]) -> Outcome {
+    let (status, mut body) = error(status, code, why);
+    if !spent.is_empty() {
+        body["spent"] = json!(spent);
+    }
+    (status, body)
+}
+
 /// The `413` body, the same JSON as the other mints'.
 fn too_large_body(size: u64, limit: usize) -> Value {
     json!({
@@ -219,7 +230,7 @@ pub fn run_issue(s: &FspState, request: &IssueRequest) -> Outcome {
             }
             (StatusCode::OK, serde_json::to_value(r).unwrap_or_default())
         }
-        Err(e) => error(e.status, e.code, &e.why),
+        Err(e) => error_naming(e.status, e.code, &e.why, &e.spent),
     }
 }
 
@@ -230,7 +241,7 @@ pub fn run_spend(s: &FspState, request: &SpendRequest) -> Outcome {
     let now = (s.clock)();
     match block_on_new_runtime(|| s.spender.spend(request, now)) {
         Ok(Ok(r)) => (StatusCode::OK, serde_json::to_value(r).unwrap_or_default()),
-        Ok(Err(e)) => error(e.status, e.code, &e.why),
+        Ok(Err(e)) => error_naming(e.status, e.code, &e.why, &e.spent),
         Err(e) => error(
             500,
             sp_wire::codes::INTERNAL,

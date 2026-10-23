@@ -1,7 +1,6 @@
 //! fsp-mint command line: `config`, `service-key`, `serve`, `export-esp`,
 //! `audit`.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -106,7 +105,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
     let dir = base.join(&cfg.network);
     println!("fsp-mint on {}: data in {}", cfg.network, dir.display());
     let mut rot = cfg.rotation();
-    rot.first_issue = fsp_mint::keysets::load_first_issue(&dir).map_err(|e| e.to_string())?;
+    rot.first_issue = fsp_mint::keysets::load_first_issue(&dir)
+        .map_err(|e| format!("cannot read the data in {}: {e}", dir.display()))?;
     let show = |t: Option<u64>| {
         t.map(|t| format!("{t} (Unix seconds, UTC)"))
             .unwrap_or_else(|| "not yet".into())
@@ -174,34 +174,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 _ => return Err("export-esp needs --out DIR".into()),
             };
             let service = cfg.service().ok_or("service.did is not set")?;
-            let mut issues = Issues::open(&dir).map_err(|e| e.to_string())?;
-            let mut by_day: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
-            for (i, k) in issues.data.kept.iter().enumerate() {
-                if !k.exported {
-                    by_day.entry(k.redeemable_after_day).or_default().push(i);
-                }
+            let written = fsp_mint::export::export_esp(&dir, &out, service, fsp_mint::now_secs())?;
+            for (file, notes) in &written {
+                println!("wrote {} ({notes} notes)", file.display());
             }
-            std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
-            for (day, idx) in &by_day {
-                let notes: Vec<serde_json::Value> = idx
-                    .iter()
-                    .map(|&i| {
-                        let k = &issues.data.kept[i];
-                        serde_json::json!({"amount": k.amount, "note": k.note, "spend_secret": k.spend_secret, "keyset": k.keyset})
-                    })
-                    .collect();
-                let file = out.join(format!("esp-{day}-{}.json", fsp_mint::now_secs()));
-                let body = serde_json::json!({"service": service, "redeemable_after_day": day, "notes": notes});
-                store::save(&file, &body).map_err(|e| e.to_string())?;
-                println!("wrote {} ({} notes)", file.display(), idx.len());
-            }
-            for idx in by_day.values() {
-                for &i in idx {
-                    issues.data.kept[i].exported = true;
-                }
-            }
-            issues.save().map_err(|e| e.to_string())?;
-            if by_day.is_empty() {
+            if written.is_empty() {
                 println!("no ESP to export");
             }
             Ok(())

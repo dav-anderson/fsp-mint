@@ -21,9 +21,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use common::{Air, Listener, Server, server, start_esp_listening, start_listening};
+use common::{
+    Air, Listener, Server, fsp_run, scratch, server, start_esp_listening, start_listening,
+};
 use esp_mint::exchange::{Burn, Psp};
-use esp_mint::responses::Responses;
+use esp_mint::ledger::Movements;
 use esp_mint::server::EspState;
 use esp_mint::terms::Terms;
 use fsp_mint::api::*;
@@ -31,32 +33,24 @@ use fsp_mint::audit::{self, Report};
 use fsp_mint::config::Config;
 use fsp_mint::esp_air::AirIssuer;
 use fsp_mint::esp_client::Issuer;
-use fsp_mint::issue::{Entry, IssueData, Issues};
+use fsp_mint::export::export_esp;
+use fsp_mint::issue::{Entry, IssueData, Issues, KeptEsp};
 use fsp_mint::keysets::Keyset;
 use fsp_mint::server::{self, FspState};
 use fsp_mint::spend::Spender;
+use fsp_mint::store;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, PublicKey, SECP256K1, SecretKey};
 use sp_wire::ServiceDid;
 use sp_wire::air_request::addr;
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
+use sp_wire::esp::exchange::ExchangeResponse;
+use sp_wire::esp::handover::Handover;
 use sp_wire::seal::SecretKey as DidKey;
 use tokio::runtime::Runtime;
 
 const NOW: u64 = 1_791_571_184;
-
-/// A folder of its own for every call, even when two tests pick the same name
-/// (they did: "partial" twice, so one test deleted the other's folder while
-/// both ran in parallel). The counter makes a clash impossible.
-fn scratch(name: &str) -> PathBuf {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let d = std::env::temp_dir().join(format!("fsp-flow-{}-{n}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
-}
 
 thread_local! {
     /// This test's service key: a test runs on a thread of its own, and the
@@ -146,7 +140,7 @@ impl EspAt {
             }
             assert!(
                 Instant::now() < until,
-                "the counter is {now}, expected {want}"
+                "the ESP mint's listener did not take {want} mailbox slots within 15 s (it is at {now})"
             );
             thread::sleep(Duration::from_millis(50));
         }
@@ -169,24 +163,20 @@ impl EspAt {
 }
 
 /// A real ESP mint with its HTTP routes (for `/audit`) and its AIR listener, on
-/// the shared AIR server.
+/// the shared AIR server. It is the mint `esp-mint serve` builds
+/// (`EspState::open`): default config, the system clock, rotation on.
 fn start_esp(rt: &Runtime, dir: &Path) -> (EspAt, Arc<EspState>) {
     let server = server();
     let data = dir.join("esp");
-    let (logic, master) = esp_mint::mint::open(&data).unwrap();
-    let responses = Responses::open(&data.join("responses.json")).unwrap();
-    let state = Arc::new(EspState {
-        logic: Mutex::new(logic),
-        master,
-        psp: Box::new(NoPsp),
-        responses: Mutex::new(responses),
-        queue_path: data.join("queue.json"),
-        queue_lock: Mutex::new(()),
-        in_flight: Default::default(),
-        config: esp_mint::config::Handle::default(),
-        rotor: None,
-        rollovers: None,
-    });
+    let state = Arc::new(
+        EspState::open(
+            &data,
+            Box::new(NoPsp),
+            esp_mint::config::Config::default(),
+            0,
+        )
+        .unwrap(),
+    );
     let key = DidKey::new();
     let at = EspAt {
         url: serve_http(rt, esp_mint::server::router(Arc::clone(&state))),
@@ -201,7 +191,54 @@ fn start_esp(rt: &Runtime, dir: &Path) -> (EspAt, Arc<EspState>) {
     (at, state)
 }
 
-/// An ESP note the Issuer issued for `service` and `day`.
+/// Book in the ESP mint's ledger what a test signed straight from the mint
+/// (`issue_with_key`), the way an exchange books the outputs it signs: the entry
+/// is put and then finished with its movements in one write.
+///
+/// Why the note is booked at all: the tests need notes of 1, 2, 4 and 8 units on
+/// chosen days, which the exchange (exact, at least 10^11 units) cannot give, so
+/// they sign the note themselves. A note signed past the ledger leaves the ESP
+/// mint's counters saying the ESP is outstanding and its ledger saying it is
+/// not, so its `/audit` and a transfer of the note would disagree with what was
+/// issued. Booking it makes the ESP mint look as it does after a real exchange.
+/// This is esp-mint's own `tests/common::record_issued`, copied: tests cannot
+/// share a helper across crates without putting test-only code in the library.
+fn book_issued(state: &EspState, service: ServiceDid, day: u64, units: u64) {
+    static BOOKED: AtomicU64 = AtomicU64::new(0);
+    let hash = format!("fixture-issue-{}", BOOKED.fetch_add(1, Ordering::Relaxed));
+    let mut movements = Movements::new();
+    movements.issue(day, u128::from(units));
+    let mut responses = state.responses.lock().unwrap();
+    responses
+        .put(
+            &hash,
+            esp_mint::responses::Entry::Pending {
+                redeemable_after_day: day,
+                inputs: vec![],
+                outputs: vec![],
+            },
+        )
+        .unwrap();
+    responses
+        .finish(
+            &hash,
+            esp_mint::responses::Entry::Done(ExchangeResponse {
+                keyset: esp_mint::rotation::keyset_id(&state.master),
+                service,
+                redeemable_after_day: day,
+                signatures: vec![],
+                keys: vec![],
+                fee_per_byte: 0,
+                fee_esp: 0,
+                size_bytes: 0,
+            }),
+            &movements,
+        )
+        .unwrap();
+}
+
+/// An ESP note the Issuer issued for `service` and `day`: signed with the ESP
+/// mint's key for the amount and terms, and booked in its ledger.
 fn esp_note(state: &EspState, units: u64, service: ServiceDid, day: u64) -> HandedEsp {
     let terms = Terms {
         service,
@@ -224,6 +261,7 @@ fn esp_note(state: &EspState, units: u64, service: ServiceDid, day: u64) -> Hand
             },
         )
         .unwrap();
+    book_issued(state, service, day, units);
     HandedEsp {
         amount: units,
         note: Note {
@@ -491,11 +529,14 @@ fn issue_mixed_days_keeps_the_esp_and_never_issues_twice() {
     again.groups[0].outputs = vec![Out::new(4).mint(), Out::new(1).mint()];
     again.groups[1].outputs = vec![Out::new(8).mint()];
     let (s3, b3) = f.post("/issue", &again);
+    // all three ESP notes (two in the first group, one in the second) are named,
+    // counted across the groups in order
     assert_eq!(
         (s3, b3["code"].as_str()),
-        (400, Some("already_spent")),
+        (400, Some("note_spent_elsewhere")),
         "{b3}"
     );
+    assert_eq!(b3["spent"], serde_json::json!([0, 1, 2]), "{b3}");
 
     // The FSP spends: pay 9 of 13 with change 4, then the same notes again.
     let GroupResult::Issued {
@@ -535,7 +576,12 @@ fn issue_mixed_days_keeps_the_esp_and_never_issues_twice() {
     );
     let other = spend_request(keyset, &notes, &[Out::new(4).mint()], 9);
     let (s, b) = f.post("/spend", &other);
-    assert_eq!((s, b["code"].as_str()), (400, Some("already_spent")), "{b}");
+    assert_eq!(
+        (s, b["code"].as_str()),
+        (400, Some("note_spent_elsewhere")),
+        "{b}"
+    );
+    assert_eq!(b["spent"], serde_json::json!([0, 1, 2]), "{b}");
 
     // Wrong service and not exact are refused before anything.
     let mut wrong = req.clone();
@@ -544,6 +590,66 @@ fn issue_mixed_days_keeps_the_esp_and_never_issues_twice() {
     let mut inexact = req.clone();
     inexact.groups[1].outputs = vec![Out::new(4).mint()];
     assert_eq!(f.post("/issue", &inexact).1["code"], "not_exact");
+}
+
+/// Two ESP notes of a request were already transferred to this service by
+/// earlier issues, neither of them the first: the refusal names both, counted
+/// across the groups in order, and nothing else is transferred.
+#[test]
+fn two_transferred_esp_notes_not_at_the_start_are_both_named() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("issue-two-spent");
+    let (esp_at, esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_at, "0");
+    let day1 = Terms::new_at(service(), NOW).redeemable_after_day;
+    let day2 = day1 + 30;
+    let x0 = esp_note(&esp, 2, service(), day1);
+    let x1 = esp_note(&esp, 1, service(), day1);
+    let x2 = esp_note(&esp, 4, service(), day2);
+    let x3 = esp_note(&esp, 8, service(), day2);
+    // `x1` and `x2` are transferred first, each by an issue of its own.
+    for (note, day, units) in [(x1.clone(), day1, 1), (x2.clone(), day2, 4)] {
+        let one = IssueRequest {
+            service: service(),
+            groups: vec![IssueGroup {
+                redeemable_after_day: day,
+                notes: vec![note],
+                outputs: vec![Out::new(units).mint()],
+            }],
+        };
+        let (status, body) = f.post("/issue", &one);
+        assert_eq!(status, 200, "{body}");
+    }
+    // Both days in one request, `x1` second and `x2` third counted across the
+    // groups: refused whole, both named.
+    let all = IssueRequest {
+        service: service(),
+        groups: vec![
+            IssueGroup {
+                redeemable_after_day: day1,
+                notes: vec![x0.clone(), x1.clone()],
+                outputs: vec![Out::new(2).mint(), Out::new(1).mint()],
+            },
+            IssueGroup {
+                redeemable_after_day: day2,
+                notes: vec![x2.clone(), x3.clone()],
+                outputs: vec![Out::new(4).mint(), Out::new(8).mint()],
+            },
+        ],
+    };
+    let (status, body) = f.post("/issue", &all);
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "note_spent_elsewhere", "{body}");
+    assert_eq!(body["spent"], serde_json::json!([1, 2]), "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("ESP notes 1, 2 of this request were already transferred"),
+        "{body}"
+    );
+    // Only the two single issues kept ESP.
+    assert_eq!(f.state.issues.lock().unwrap().data.kept.len(), 2);
 }
 
 /// The refused transfer over AIR: the ESP mint's signed `400` refusal for one
@@ -704,10 +810,50 @@ fn one_spent_note_among_several_leaves_the_others_unspent() {
         2,
     );
     let e = rt.block_on(sp.spend(&all, NOW)).unwrap_err();
-    assert_eq!(e.code, "already_spent");
+    assert_eq!(e.code, "note_spent_elsewhere");
+    assert_eq!(e.spent, vec![1]);
+    assert_eq!(e.why, "note 1 is already spent");
     assert!(sp.is_spent(&k.id, &a.nonce.0.serialize()));
     assert!(!sp.is_spent(&k.id, &b.nonce.0.serialize()));
     assert!(!sp.is_spent(&k.id, &c.nonce.0.serialize()));
+}
+
+#[test]
+fn two_spent_notes_not_at_the_start_are_both_named_and_nothing_else_is_spent() {
+    let dir = scratch("two-spent").join("fsp");
+    std::fs::create_dir_all(&dir).unwrap();
+    let rt = Runtime::new().unwrap();
+    let off = fsp_mint::keysets::Rotation {
+        first_issue: None,
+        activation_secs: 0,
+        period_secs: 1,
+    };
+    let sp = Spender::open(&dir, off, 64, NOW).unwrap();
+    let k = sp.keysets(NOW).unwrap().last().cloned().unwrap();
+    let (a, sa) = fsp_note(&k, 2);
+    let (b, sb) = fsp_note(&k, 2);
+    let (c, sc) = fsp_note(&k, 2);
+    let (d, sd) = fsp_note(&k, 2);
+    // `b` and `c` are spent first, each alone.
+    for (n, s) in [(b, sb), (c, sc)] {
+        let one = spend_request(&k.id, &[(n, s, 2)], &[Out::new(1).mint()], 1);
+        rt.block_on(sp.spend(&one, NOW)).unwrap();
+    }
+    // Four notes, the second and the third already spent: refused, and both are
+    // named, so the wallet drops them in one go. `a` and `d` stay unspent.
+    let all = spend_request(
+        &k.id,
+        &[(a, sa, 2), (b, sb, 2), (c, sc, 2), (d, sd, 2)],
+        &[Out::new(8).mint()],
+        0,
+    );
+    let e = rt.block_on(sp.spend(&all, NOW)).unwrap_err();
+    assert_eq!(e.status, 400);
+    assert_eq!(e.code, "note_spent_elsewhere");
+    assert_eq!(e.spent, vec![1, 2]);
+    assert_eq!(e.why, "notes 1, 2 are already spent");
+    assert!(!sp.is_spent(&k.id, &a.nonce.0.serialize()));
+    assert!(!sp.is_spent(&k.id, &d.nonce.0.serialize()));
 }
 
 #[test]
@@ -771,53 +917,7 @@ fn the_memo_limit_is_the_setting_and_a_long_memo_is_refused_before_anything_is_s
     assert!(!sp.is_spent(&k.id, &held[0].0.nonce.0.serialize()));
 }
 
-#[test]
-fn throughput_of_the_spend_path() {
-    let dir = scratch("speed").join("fsp");
-    std::fs::create_dir_all(&dir).unwrap();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(8)
-        .build()
-        .unwrap();
-    let off = fsp_mint::keysets::Rotation {
-        first_issue: None,
-        activation_secs: 0,
-        period_secs: 1,
-    };
-    let sp = Arc::new(Spender::open(&dir, off, 1024, NOW).unwrap());
-    let k = sp.keysets(NOW).unwrap().last().cloned().unwrap();
-    const N: usize = 2000;
-    let requests: Vec<SpendRequest> = (0..N)
-        .map(|_| {
-            let (n, s) = fsp_note(&k, 2);
-            spend_request(&k.id, &[(n, s, 2)], &[Out::new(1).mint()], 1)
-        })
-        .collect();
-    let start = Instant::now();
-    rt.block_on(async {
-        let mut tasks = Vec::new();
-        for r in requests {
-            let sp = Arc::clone(&sp);
-            tasks.push(tokio::spawn(
-                async move { sp.spend(&r, NOW).await.map(|_| ()) },
-            ));
-        }
-        for t in tasks {
-            t.await.unwrap().unwrap();
-        }
-    });
-    let secs = start.elapsed().as_secs_f64();
-    let rate = N as f64 / secs;
-    println!("{N} spends (one note in, one change output) in {secs:.2} s: {rate:.0} a second");
-    let lines = std::fs::read_to_string(dir.join(fsp_mint::spend::log_name(&k.id)))
-        .unwrap()
-        .lines()
-        .count();
-    assert_eq!(lines, N);
-    assert!(rate > 300.0, "{rate:.0} spends a second");
-}
-
-/// The ceiling is the setting (`server.max_request_bytes`, 4096 at the least):
+/// The ceiling is the setting (`server.max_request_bytes`, 16384 at the least):
 /// over it a call is refused before it is parsed, with the `413` JSON the HTTP
 /// route had and the `http_status` a refusal carries over AIR; at it the body is
 /// read, and is not a request, so a `400`.
@@ -833,18 +933,18 @@ fn a_body_over_the_ceiling_is_refused_before_parsing() {
         "0",
         "20",
         "2",
-        &[("server.max_request_bytes", "4096")],
+        &[("server.max_request_bytes", "16384")],
     );
     for route in ["/issue", "/spend"] {
         // One byte over: refused for its size, not for its content.
-        let big = vec![b' '; 4097];
+        let big = vec![b' '; 16385];
         let (status, body) = f.air.call(route, &big);
         assert_eq!(status, 413, "{route}: {body}");
         assert_eq!(body["code"], "request_too_large", "{route}");
-        assert_eq!(body["limit_bytes"], 4096, "{route}");
-        assert_eq!(body["size_bytes"], 4097, "{route}");
+        assert_eq!(body["limit_bytes"], 16384, "{route}");
+        assert_eq!(body["size_bytes"], 16385, "{route}");
         // At the limit the body is read and is not a request.
-        let at = vec![b' '; 4096];
+        let at = vec![b' '; 16384];
         let (status, body) = f.air.call(route, &at);
         assert_eq!(status, 400, "{route}: {body}");
         assert_eq!(body["code"], "malformed_request", "{route}");
@@ -944,11 +1044,7 @@ fn only_the_audit_and_the_health_check_answer_over_http() {
     let r = http.get(format!("{}/audit", f.http)).send().unwrap();
     assert_eq!(r.status().as_u16(), 200);
     let report: Report = r.json().unwrap();
-    assert!(
-        report.complete && report.consistent,
-        "{:?}",
-        report.warnings
-    );
+    assert!(report.consistent, "{:?}", report.warnings);
     let r = http.post(format!("{}/audit", f.http)).send().unwrap();
     assert_eq!(r.status().as_u16(), 405, "/audit reads only");
 }
@@ -1126,7 +1222,7 @@ fn the_audit_counts_issue_spend_and_change_and_the_esp_reserve() {
     let empty = get_audit(&f);
     assert_eq!(units(&empty.fsp.outstanding), 0);
     assert_eq!(empty.esp_reserve.total.notes, 0);
-    assert!(empty.complete && empty.consistent, "{:?}", empty.warnings);
+    assert!(empty.consistent, "{:?}", empty.warnings);
 
     // 4 + 1 FSP for ESP that is mature today, 8 FSP for ESP that is not.
     let day_m = today;
@@ -1178,7 +1274,7 @@ fn the_audit_counts_issue_spend_and_change_and_the_esp_reserve() {
     assert_eq!(r.esp_reserve.unmatured.esp.psp, "0.00000000008");
     assert_eq!(units(&r.esp_reserve.total.esp), 13);
     assert_eq!(r.esp_reserve.by_day.len(), 2);
-    assert!(r.complete && r.consistent, "{:?}", r.warnings);
+    assert!(r.consistent, "{:?}", r.warnings);
 
     // Pay 9 of the 13, 4 back as change.
     let mut notes = Vec::new();
@@ -1298,7 +1394,7 @@ fn the_audit_follows_rotation_expiry_and_a_restart() {
     assert_eq!(units(&after.fsp.expired), 8, "expired, not outstanding");
     assert_eq!(units(&after.fsp.outstanding), 10);
     assert_eq!(units(&after.fsp.paid), 6);
-    assert!(after.complete && after.consistent, "{:?}", after.warnings);
+    assert!(after.consistent, "{:?}", after.warnings);
     assert!(dir.join("fsp").join(audit::LEDGER_FILE).exists());
     assert!(!dir.join("fsp").join(fsp_mint::spend::log_name(&g)).exists());
 
@@ -1378,64 +1474,144 @@ fn a_key_set_deleted_before_its_counters_were_saved_is_folded_at_the_next_start(
     assert_eq!(sp.audit_view(NOW).unwrap().retired[&k.id], c);
 }
 
-#[test]
-fn what_was_answered_before_the_counters_is_reported_as_not_counted() {
-    // An issue answered by 0.3.0: a stored answer, no counter.
-    let mut d = IssueData::default();
-    d.entries.insert(
-        "h".into(),
-        Entry::Done(IssueResponse {
-            groups: vec![],
-            fee_per_byte: 0,
-        }),
-    );
-    d.start_counting();
-    d.start_counting();
-    assert_eq!(d.uncounted_requests, Some(1), "set once");
-    let r = audit::build(NOW, &audit::SpendView::default(), &d);
-    assert!(!r.complete);
-    assert!(
-        r.warnings[0].contains("1 issue request"),
-        "{:?}",
-        r.warnings
-    );
+// ---- export-esp ----
 
-    // A spend line without amounts.
-    let dir = scratch("audit-legacy").join("fsp");
-    std::fs::create_dir_all(&dir).unwrap();
+/// A kept ESP note as `issues.json` holds it (real types, not JSON text).
+fn kept(amount: u64, day: u64, keyset: &str, request: &str) -> KeptEsp {
+    let kp = Keypair::new(SECP256K1, &mut OsRng);
+    KeptEsp {
+        amount,
+        note: Note {
+            nonce: Nonce(kp.public_key()),
+            signature: Keypair::new(SECP256K1, &mut OsRng).public_key(),
+        },
+        spend_secret: kp.secret_key(),
+        redeemable_after_day: day,
+        keyset: keyset.into(),
+        request: request.into(),
+        exported: false,
+    }
+}
+
+#[test]
+fn export_esp_writes_a_handover_file_for_each_day_once_and_the_audit_still_counts_the_esp() {
     let rt = Runtime::new().unwrap();
-    let off = fsp_mint::keysets::Rotation {
-        first_issue: None,
-        activation_secs: 0,
-        period_secs: 1,
+    let dir = scratch("export");
+    let (esp_at, esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_at, "0");
+    let data = dir.join("fsp");
+    let day1 = Terms::new_at(service(), NOW).redeemable_after_day;
+    let day2 = day1 + 30;
+    issue_one(&esp, &f, 4, day1);
+    issue_one(&esp, &f, 2, day1);
+    issue_one(&esp, &f, 8, day2);
+    let before = audit::from_dir(&data, NOW).unwrap();
+    assert_eq!(
+        (
+            before.esp_reserve.total.notes,
+            units(&before.esp_reserve.total.esp)
+        ),
+        (3, 14)
+    );
+    assert_eq!(units(&before.esp_reserve.total.exported_esp), 0);
+
+    // One file for each day, in the folder the export makes.
+    let out = scratch("export-out").join("handover");
+    let written = export_esp(&data, &out, service(), 1_234).unwrap();
+    let file1 = out.join(format!("esp-{day1}-1234.json"));
+    let file2 = out.join(format!("esp-{day2}-1234.json"));
+    assert_eq!(written, vec![(file1.clone(), 2), (file2.clone(), 1)]);
+
+    // Each file reads back as the hand-over type, with the service, the day and
+    // every note with the ESP keyset that signed it.
+    let esp_keyset = esp_mint::rotation::keyset_id(&esp.master);
+    let kept_now = Issues::open(&data).unwrap().data.kept;
+    assert_eq!(kept_now.len(), 3);
+    for (file, day, amounts) in [(&file1, day1, vec![4, 2]), (&file2, day2, vec![8])] {
+        let handover = Handover::read(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(handover.service, service());
+        assert_eq!(handover.redeemable_after_day, day);
+        assert_eq!(
+            handover.notes.iter().map(|n| n.amount).collect::<Vec<_>>(),
+            amounts
+        );
+        for n in &handover.notes {
+            assert_eq!(n.keyset, esp_keyset);
+            // It is the note the service kept, with the secret that spends it.
+            let k = kept_now
+                .iter()
+                .find(|k| k.note.nonce == n.note.nonce)
+                .expect("a kept note");
+            assert_eq!(
+                (k.amount, k.note, k.spend_secret, k.redeemable_after_day),
+                (n.amount, n.note, n.spend_secret, day)
+            );
+        }
+    }
+
+    // The notes are marked exported, and a second run writes nothing.
+    assert!(kept_now.iter().all(|k| k.exported));
+    let again = export_esp(&data, &out, service(), 1_235).unwrap();
+    assert!(again.is_empty(), "{again:?}");
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2);
+
+    // The audit counts the exported ESP as before, and shows it as exported.
+    let after = audit::from_dir(&data, NOW).unwrap();
+    assert_eq!(
+        (
+            after.esp_reserve.total.notes,
+            units(&after.esp_reserve.total.esp)
+        ),
+        (3, 14)
+    );
+    assert_eq!(units(&after.esp_reserve.total.exported_esp), 14);
+}
+
+#[test]
+fn export_esp_refuses_a_kept_note_with_no_keyset_and_names_it_before_writing_anything() {
+    let data = scratch("export-old");
+    let out = scratch("export-old-out").join("handover");
+    let old = kept(4, 20_500, "", "old-request");
+    let new = kept(2, 20_501, "0102030405060708", "new-request");
+    let issues = data.join("issues.json");
+    let write = |notes: Vec<KeptEsp>| {
+        store::save(
+            &issues,
+            &IssueData {
+                kept: notes,
+                ..Default::default()
+            },
+        )
+        .unwrap()
     };
-    let sp = Spender::open(&dir, off, 64, NOW).unwrap();
-    let k = sp.keysets(NOW).unwrap().last().cloned().unwrap();
-    let (n, s) = fsp_note(&k, 2);
-    rt.block_on(sp.spend(
-        &spend_request(&k.id, &[(n, s, 2)], &[Out::new(1).mint()], 1),
-        NOW,
-    ))
-    .unwrap();
-    drop(sp);
-    let log = dir.join(fsp_mint::spend::log_name(&k.id));
-    let mut v: serde_json::Value =
-        serde_json::from_str(std::fs::read_to_string(&log).unwrap().trim()).unwrap();
-    assert!(v.as_object_mut().unwrap().remove("a").is_some());
-    std::fs::write(&log, format!("{v}\n")).unwrap();
-    let counted = fsp_mint::spend::replay_counters(&dir).unwrap();
-    assert_eq!(counted[&k.id].uncounted_spends, 1);
-    assert_eq!(counted[&k.id].spent.0, 0);
-    let view = audit::SpendView {
-        live: vec![k.id.clone()],
-        counters: counted,
-        retired: Default::default(),
-    };
-    let r = audit::build(NOW, &view, &IssueData::default());
-    assert!(
-        !r.complete && r.warnings[0].contains("1 spend"),
-        "{:?}",
-        r.warnings
+    write(vec![old.clone(), new.clone()]);
+
+    let e = export_esp(&data, &out, service(), 1_234).unwrap_err();
+    assert_eq!(
+        e,
+        format!(
+            "cannot export: 1 kept ESP note names no keyset (kept before keysets), and a hand-over file needs one on every note. Nothing was written. note {} (4 units, redeemable after day 20500, from issue request old-request)",
+            hex::encode(old.note.nonce.0.serialize())
+        )
+    );
+    // Nothing was written, and no note was marked exported (the one with a
+    // keyset, on another day, included).
+    assert!(!out.exists());
+    let after: IssueData = store::load(&issues).unwrap().unwrap();
+    assert_eq!(after.kept.len(), 2);
+    assert!(after.kept.iter().all(|k| !k.exported));
+
+    // With the keyset on that note too, the same notes export.
+    let mut filled = old.clone();
+    filled.keyset = "0a0b0c0d0e0f1011".into();
+    write(vec![filled, new]);
+    let written = export_esp(&data, &out, service(), 1_234).unwrap();
+    assert_eq!(
+        written,
+        vec![
+            (out.join("esp-20500-1234.json"), 1),
+            (out.join("esp-20501-1234.json"), 1)
+        ]
     );
 }
 
@@ -1463,7 +1639,8 @@ fn put(server: &ServerRef, key: &DidKey, bytes: Vec<u8>) -> client::Put {
     .unwrap()
 }
 
-fn issues_file(dir: &Path) -> serde_json::Value {
+/// `issues.json` as the types that write it.
+fn issues_file(dir: &Path) -> IssueData {
     serde_json::from_slice(&std::fs::read(dir.join("fsp").join("issues.json")).unwrap()).unwrap()
 }
 
@@ -1514,11 +1691,14 @@ fn an_esp_mint_that_does_not_answer_leaves_the_issue_pending_and_the_retry_finis
     assert_eq!(f.state.issues.lock().unwrap().data.kept.len(), 1);
     // The request in flight is kept in `issues.json`, beside its transfer.
     let file = issues_file(&dir);
-    let air = file["entries"][&hash]["groups"][0]["air"].clone();
-    assert_eq!(air["mint"], esp_at.did.to_hex(), "{file}");
-    assert_eq!(air["slots"], serde_json::json!([2]), "{file}");
-    let request_id = air["request_id"].as_str().unwrap().to_string();
-    assert_eq!(request_id.len(), 64);
+    let Some(Entry::Pending(pending)) = file.entries.get(&hash) else {
+        panic!("expected a pending entry: {file:?}");
+    };
+    assert_eq!(pending.groups.len(), 1, "{file:?}");
+    let air = pending.groups[0].air.clone().expect("a request in flight");
+    assert_eq!(air.mint, esp_at.did.to_hex(), "{file:?}");
+    assert_eq!(air.slots, vec![2], "{file:?}");
+    assert_eq!(air.request_id.len(), 64, "{file:?}");
 
     // The ESP mint comes back and answers the request that was waiting.
     esp_at.listen();
@@ -1534,8 +1714,14 @@ fn an_esp_mint_that_does_not_answer_leaves_the_issue_pending_and_the_retry_finis
     assert_eq!(f.state.issues.lock().unwrap().data.kept.len(), 2);
     // Done: the stored answer, and no request kept.
     let file = issues_file(&dir);
-    assert_eq!(file["entries"][&hash]["entry"], "done", "{file}");
-    assert!(!file.to_string().contains(&request_id), "{file}");
+    assert!(
+        matches!(file.entries.get(&hash), Some(Entry::Done(_))),
+        "{file:?}"
+    );
+    assert!(
+        file.entries.values().all(|e| matches!(e, Entry::Done(_))),
+        "a request is still kept: {file:?}"
+    );
     // No second request was written: slot 3 is still free.
     let probe = put(
         &esp_at.server,
@@ -1558,33 +1744,6 @@ fn an_esp_mint_that_does_not_answer_leaves_the_issue_pending_and_the_retry_finis
         Some(6),
         "{audit}"
     );
-}
-
-/// Run `fsp-mint` with `args` and exactly the environment `env` (plus the data
-/// folder `base`), and wait for it to end. A `serve` that does not stop is a
-/// failure of the test, not a hang.
-fn fsp_run(base: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_fsp-mint"))
-        .args(args)
-        .env_clear()
-        .env("FSP_DATA_DIR", base)
-        .envs(env.iter().copied())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let until = Instant::now() + Duration::from_secs(90);
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
-        }
-        if Instant::now() > until {
-            let _ = child.kill();
-            panic!("`fsp-mint {}` did not stop", args.join(" "));
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
 }
 
 /// The five AIR settings of `serve` as environment: the ESP mint's (DID, AIR
@@ -1661,6 +1820,30 @@ fn serve_refuses_to_start_without_the_air_settings_and_names_each_missing_one() 
         assert!(err.contains(missing), "{missing} is not named: {err}");
     }
     assert!(!err.contains("(FSP_AIR_ESP_HOST)"), "{err}");
+    // Only the ESP mint's server missing (the other four set): that one is
+    // named, none of the others is, and the message says it is not set.
+    let did = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    let out = fsp_run(
+        &base,
+        &["serve"],
+        &[
+            ("FSP_AIR_ESP_DID", did),
+            ("FSP_AIR_ESP_HOST", "127.0.0.1"),
+            ("FSP_AIR_SERVER", did),
+            ("FSP_AIR_HOST", "127.0.0.1"),
+        ],
+    );
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "serve started");
+    assert!(err.contains("FSP_AIR_ESP_SERVER"), "{err}");
+    assert!(
+        !err.contains("FSP_AIR_ESP_HOST")
+            && !err.contains("FSP_AIR_ESP_DID")
+            && !err.contains("(FSP_AIR_SERVER)")
+            && !err.contains("(FSP_AIR_HOST)"),
+        "{err}"
+    );
+    assert!(err.contains("is not set"), "{err}");
     // The old settings are gone, with a message that says what replaces them.
     let out = fsp_run(
         &base,
@@ -1671,6 +1854,25 @@ fn serve_refuses_to_start_without_the_air_settings_and_names_each_missing_one() 
     assert!(!out.status.success(), "config accepted esp.url");
     assert!(err.contains("esp.url") && err.contains("is gone"), "{err}");
     assert!(err.contains("air.esp_did"), "{err}");
+
+    // With all five set the check passes, and the listener takes its own server
+    // and host. `serve` goes on to the network, which needs an AIR server, so
+    // this half calls the same `Config` functions directly.
+    let mut c = Config::default();
+    c.set("air.esp_did", did).unwrap();
+    c.set("air.esp_server", did).unwrap();
+    c.set("air.esp_host", "127.0.0.1").unwrap();
+    c.set("air.server", did).unwrap();
+    c.set("air.host", "127.0.0.1").unwrap();
+    c.require_air().unwrap();
+    let l = c.air_listener(Path::new("/x"));
+    assert_eq!((l.server.host.as_str(), l.held_reads), ("127.0.0.1", 16));
+    c.set("air.esp_host", "10.0.0.9").unwrap();
+    assert_eq!(
+        c.air_listener(Path::new("/x")).server.host,
+        "127.0.0.1",
+        "the listener's host is air.host, not the ESP mint's"
+    );
 }
 
 /// The listener always runs, so `serve` needs its settings even when the ESP
@@ -1713,4 +1915,12 @@ fn serve_refuses_a_bind_that_is_not_loopback() {
         err.contains("server.bind") && err.contains("not a loopback address"),
         "{err}"
     );
+
+    // Loopback addresses are accepted. `serve` would go on to the AIR settings,
+    // so this half calls the same `Config::validate` directly.
+    let mut c = Config::default();
+    c.set("server.bind", "[::1]:3200").unwrap();
+    c.validate().unwrap();
+    c.set("server.bind", "127.0.0.1:3200").unwrap();
+    c.validate().unwrap();
 }

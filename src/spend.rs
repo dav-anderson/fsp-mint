@@ -51,9 +51,8 @@ struct Record {
     h: String,
     n: Vec<(String, String)>,
     r: SpendResponse,
-    /// The amounts, for the audit. Absent in lines written before 0.4.0.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    a: Option<Amounts>,
+    /// The amounts, for the audit.
+    a: Amounts,
 }
 
 /// The units of a spend: of each note in `n` (same order) and of each output.
@@ -66,13 +65,7 @@ struct Amounts {
 /// Add one logged spend to the counters: its notes as spent, under the key
 /// set of each; its change under the key set that signed it (`r.keyset`).
 fn apply(stats: &mut HashMap<String, Counters>, record: &Record) {
-    let Some(a) = &record.a else {
-        stats
-            .entry(record.r.keyset.clone())
-            .or_default()
-            .uncounted_spends += 1;
-        return;
-    };
+    let a = &record.a;
     for ((keyset, _), units) in record.n.iter().zip(&a.i) {
         stats.entry(keyset.clone()).or_default().spent.0 += *units as i128;
     }
@@ -177,6 +170,26 @@ pub struct SpendError {
     pub status: u16,
     pub code: &'static str,
     pub why: String,
+    /// With `note_spent_elsewhere`: the positions of every input that is
+    /// already spent. Empty for every other refusal.
+    pub spent: Vec<usize>,
+}
+
+/// The refusal for inputs that are already spent: `note_spent_elsewhere`, with
+/// every spent position in `spent` and in the text.
+fn spent_elsewhere(spent: Vec<usize>) -> SpendError {
+    let list: Vec<String> = spent.iter().map(|i| i.to_string()).collect();
+    let why = if spent.len() == 1 {
+        format!("note {} is already spent", list[0])
+    } else {
+        format!("notes {} are already spent", list.join(", "))
+    };
+    SpendError {
+        status: 400,
+        code: sp_wire::codes::NOTE_SPENT_ELSEWHERE,
+        why,
+        spent,
+    }
 }
 
 fn refuse(code: &'static str, why: impl Into<String>) -> SpendError {
@@ -184,6 +197,7 @@ fn refuse(code: &'static str, why: impl Into<String>) -> SpendError {
         status: 400,
         code,
         why: why.into(),
+        spent: Vec::new(),
     }
 }
 
@@ -453,7 +467,9 @@ impl Spender {
         }
     }
 
-    /// Whether a note of a keyset is spent (for tests and the wallet's checks).
+    /// Whether a note of a keyset is spent. Used by tests only: nothing in the
+    /// mint or the wallet API calls it.
+    #[doc(hidden)]
     pub fn is_spent(&self, keyset: &str, nonce: &[u8; 33]) -> bool {
         self.core
             .lock()
@@ -471,6 +487,7 @@ impl Spender {
                 status: 503,
                 code: sp_wire::codes::UNAVAILABLE,
                 why: why.into(),
+                spent: Vec::new(),
             });
         }
         // Shape and amounts: no lock.
@@ -544,6 +561,7 @@ impl Spender {
                 status: 500,
                 code: sp_wire::codes::INTERNAL,
                 why: e.to_string(),
+                spent: Vec::new(),
             })?;
             if let Some(a) = core.answers.get(&hash) {
                 if a.durable {
@@ -553,6 +571,7 @@ impl Spender {
                     status: 409,
                     code: sp_wire::codes::IN_PROGRESS,
                     why: "this spend is being written: send it again".into(),
+                    spent: Vec::new(),
                 });
             }
             (core.live.clone(), deleted)
@@ -618,12 +637,19 @@ impl Spender {
                     status: 409,
                     code: sp_wire::codes::IN_PROGRESS,
                     why: "this spend is being written: send it again".into(),
+                    spent: Vec::new(),
                 });
             }
             let mut record_nonces = Vec::new();
+            let mut spent_at = Vec::new();
             for (i, input) in request.inputs.iter().enumerate() {
                 if core.find(&input.keyset).is_none() {
-                    return Err(core.not_live(i, &input.keyset));
+                    if spent_at.is_empty() {
+                        return Err(core.not_live(i, &input.keyset));
+                    }
+                    // A spent note came first, so the answer is the list of spent
+                    // notes; this one cannot be looked up, and is not on it.
+                    continue;
                 }
                 let n = input.input.note.nonce.0.serialize();
                 if core
@@ -631,12 +657,14 @@ impl Spender {
                     .get(&input.keyset)
                     .is_some_and(|s| s.contains(&n))
                 {
-                    return Err(refuse(
-                        "already_spent",
-                        format!("note {i} is already spent"),
-                    ));
+                    // Every spent input is named, not only the first: a wallet
+                    // that holds several stale notes drops them all at once.
+                    spent_at.push(i);
                 }
                 record_nonces.push((input.keyset.clone(), n));
+            }
+            if !spent_at.is_empty() {
+                return Err(spent_elsewhere(spent_at));
             }
             for (ks, n) in &record_nonces {
                 core.spent.entry(ks.clone()).or_default().insert(*n);
@@ -649,20 +677,21 @@ impl Spender {
                     .map(|(k, n)| (k.clone(), hex::encode(n)))
                     .collect(),
                 r: response.clone(),
-                a: Some(Amounts {
+                a: Amounts {
                     i: request
                         .inputs
                         .iter()
                         .map(|i| i.input.amount.units)
                         .collect(),
                     o: request.outputs.iter().map(|o| o.amount.units).collect(),
-                }),
+                },
             };
             apply(&mut core.stats, &record);
             let mut line = serde_json::to_vec(&record).map_err(|e| SpendError {
                 status: 500,
                 code: sp_wire::codes::INTERNAL,
                 why: e.to_string(),
+                spent: Vec::new(),
             })?;
             line.push(b'\n');
             core.answers.insert(
@@ -684,6 +713,7 @@ impl Spender {
                 status: 500,
                 code: sp_wire::codes::INTERNAL,
                 why: "the writer lock is poisoned".into(),
+                spent: Vec::new(),
             })?
             .send(Msg::Write {
                 file,
@@ -697,6 +727,7 @@ impl Spender {
                 status: 500,
                 code: sp_wire::codes::INTERNAL,
                 why: "the spend writer has stopped".into(),
+                spent: Vec::new(),
             });
         }
         match wait.await {
@@ -705,11 +736,13 @@ impl Spender {
                 status: 500,
                 code: sp_wire::codes::INTERNAL,
                 why: e,
+                spent: Vec::new(),
             }),
             Err(_) => Err(SpendError {
                 status: 500,
                 code: sp_wire::codes::INTERNAL,
                 why: "the spend writer has stopped".into(),
+                spent: Vec::new(),
             }),
         }
     }
@@ -719,6 +752,7 @@ impl Spender {
             status: 500,
             code: sp_wire::codes::INTERNAL,
             why: "the spend lock is poisoned".into(),
+            spent: Vec::new(),
         })
     }
 }
