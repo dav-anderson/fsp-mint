@@ -8,6 +8,8 @@ fsp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. N
 
 ## 0.6.0 (unreleased)
 
+- **Changed: mint-core `v0.2.0`, and the unused `mint-server` dependency is gone.** mint-core's `server` crate no longer exists (nothing ran its `mintd`); fsp-mint declared it and never used it. Pins: mint-core, mint-types and bdhke `v0.2.0` (from `v0.1.3`); sp-wire stays at `v0.5.0`. No source change. The dev-dependency esp-mint `v0.7.0` must be tagged on mint-core `v0.2.0` and sp-wire `v0.5.1`.
+
 **The calls to the ESP mint, and the wallets' calls to this mint, go over AIR, and only over AIR.** Builds on `sp-wire` with the `air-client` feature (a build needs the local AIR patches, see the README, "Building"); `Cargo.toml` still names `sp-wire` and the `esp-mint` test dependency by their old tags.
 
 - **Behaviour change: caps on the size ceiling, the item counts, the memo and the fee rate, checked when the settings load (regtest round 1, ROADMAP item 18).** `server.max_request_bytes` is 16,384 to 15,728,640 bytes (was 4,096 to 1 GiB; 15 MiB is the most one AIR message carries), `issue.max_items` and `spend.max_items` 64 to 25,000 (were 1 to 100,000), `spend.max_memo_bytes` 0 to 1,024 (was 0 to 65,536) and `fees.issue_fee_per_byte` 0 to 30,000,000 (was 0 to 10^12), so that no rate makes a one-note issue group cost more than a 1 PSP note. Defaults are unchanged and the fee stays 0. A settings file outside a range now stops the mint at start, naming the setting, the value and the range. The numbers are worked in DESIGN.md, "Caps on sizes and fees".
