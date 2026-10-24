@@ -2,14 +2,20 @@
 //! `FSP_...` environment variables, then checks. The same shape as esp-mint and
 //! psp-mint: every setting is in `SPECS`, an unknown key, a wrong type or a value
 //! out of range stops the mint with every problem listed, and the values in use
-//! are logged at startup with where each came from. Read once at startup; no
-//! reload yet.
+//! are logged at startup with where each came from.
+//!
+//! **Reload.** `SIGHUP` (and so `systemctl reload` and `aso reload`) reads the
+//! settings again ([`ConfigCell::reload`]). A setting whose [`Spec::reload`] is
+//! `true` applies to the next request. A setting whose `reload` is `false` keeps
+//! its running value, is named in the log, and takes effect at the next restart.
+//! If the new settings are not valid, none of them change.
 //!
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use sp_wire::ServiceDid;
 use sp_wire::storage::StoragePolicy;
@@ -90,6 +96,11 @@ pub struct Spec {
     pub default: &'static str,
     pub units: &'static str,
     pub what: &'static str,
+    /// Whether a change is picked up by `SIGHUP` (`true`: it applies to the next
+    /// request, with no restart) or only by a restart (`false`: a reload names
+    /// it and keeps the running value). Every setting is one or the other; the
+    /// README lists them.
+    pub reload: bool,
 }
 
 pub const SPECS: &[Spec] = &[
@@ -99,13 +110,15 @@ pub const SPECS: &[Spec] = &[
         default: "main",
         units: "network",
         what: "The Bitcoin network of the ESP mint this FSP mint takes ESP from: main, regtest, signet or testnet. Checked at startup against the ESP mint's network, which it reports in its mint info (over AIR); a mismatch stops the mint.",
+        reload: false,
     },
     Spec {
         key: "server.bind",
         env: "FSP_BIND",
         default: "127.0.0.1:3200",
         units: "host:port",
-        what: "The address of the HTTP API that is left: the operator's `GET /audit`. Must be a loopback IP:port: wallets reach this mint over AIR only, never over HTTP.",
+        what: "The address of the HTTP routes that are left: the operator's `GET /audit` and `POST /export-esp` (which `fsp-mint export-esp` calls) and the health monitor's `GET /health`. Must be a loopback IP:port: wallets reach this mint over AIR only, never over HTTP.",
+        reload: false,
     },
     Spec {
         key: "server.max_request_bytes",
@@ -113,6 +126,7 @@ pub const SPECS: &[Spec] = &[
         default: "1048576",
         units: "bytes",
         what: "Ceiling on a request body (an issue or a spend, as the AIR listener reads it), as on the other mints. Over it: a signed refusal with the 413 body, before anything is parsed. 16384 to 15728640 (15 MiB: the most one AIR message carries).",
+        reload: true,
     },
     Spec {
         key: "service.did",
@@ -120,6 +134,7 @@ pub const SPECS: &[Spec] = &[
         default: "",
         units: "DID (66 hex)",
         what: "The service's ID: its AIR DID, a 33-byte compressed public key (66 hex characters, starting 02 or 03; the old 32-byte x-only form is refused). Only ESP named for it is accepted. The secret half is service_key.hex in the data folder (fsp-mint service-key makes it) and must match. Required by serve.",
+        reload: false,
     },
     Spec {
         key: "fees.issue_fee_per_byte",
@@ -127,6 +142,7 @@ pub const SPECS: &[Spec] = &[
         default: "0",
         units: "units/byte",
         what: "The ESP to FSP fee: FSP units per byte of each group's canonical size (16 + 106 a note + 41 an output), taken from the group's ESP. 0 to 30000000: the cap keeps the worst one-note group (2,746 bytes) under the value of the smallest note (1 PSP, 10^11 units).",
+        reload: true,
     },
     Spec {
         key: "rotation.activation_hours",
@@ -134,6 +150,7 @@ pub const SPECS: &[Spec] = &[
         default: "8760",
         units: "hours",
         what: "Hours after the mint's first FSP issuance (recorded once in first_issue.json) before the first rollover. 0: rotation off, one keyset and one spent list for ever. 0 to 876000.",
+        reload: false,
     },
     Spec {
         key: "rotation.period_hours",
@@ -141,6 +158,7 @@ pub const SPECS: &[Spec] = &[
         default: "8760",
         units: "hours",
         what: "How long a keyset is current. Its notes stay spendable for one more period as previous, then are deleted with its spent list. 1 to 876000.",
+        reload: false,
     },
     Spec {
         key: "issue.max_items",
@@ -148,6 +166,7 @@ pub const SPECS: &[Spec] = &[
         default: "1000",
         units: "notes",
         what: "The most groups in one issue request, and the most ESP notes and the most FSP outputs in one group. More is refused 400 too_many_items before anything is spent. The wallet reads it from the fees call. 64 to 25000: at least the 64 outputs one amount can need, at most what fits one AIR message.",
+        reload: true,
     },
     Spec {
         key: "spend.max_items",
@@ -155,6 +174,7 @@ pub const SPECS: &[Spec] = &[
         default: "1000",
         units: "notes",
         what: "The most notes in, and the most outputs, in one spend. More is refused 400 too_many_items. The wallet reads it from the fees call. 64 to 25000, as for issue.max_items.",
+        reload: true,
     },
     Spec {
         key: "spend.max_memo_bytes",
@@ -162,6 +182,7 @@ pub const SPECS: &[Spec] = &[
         default: "256",
         units: "bytes",
         what: "The longest memo on a spend. A longer one is refused 400 memo_too_long before anything is spent. The wallet reads it from the fees call. 0 to 1024.",
+        reload: true,
     },
     Spec {
         key: "spend.max_batch",
@@ -169,6 +190,7 @@ pub const SPECS: &[Spec] = &[
         default: "1024",
         units: "spends",
         what: "The most spends written and synced to disk together. A spend is answered only after its batch is synced. 1 to 65536.",
+        reload: true,
     },
     Spec {
         key: "esp.keyset_ttl_secs",
@@ -176,6 +198,7 @@ pub const SPECS: &[Spec] = &[
         default: "3600",
         units: "seconds",
         what: "How long the ESP mint's current keyset, which new issue transfers name for their outputs, is used before it is read again (its keysets over AIR). It is also read again at once when the ESP mint answers keyset_retired (the cached set was deleted; a set that has only become the previous one is still signed with). If a read fails, the cached keyset is used; only with none cached is an issue refused 502 issuer_unavailable. 1 to 604800.",
+        reload: true,
     },
     Spec {
         key: "air.esp_did",
@@ -183,6 +206,7 @@ pub const SPECS: &[Spec] = &[
         default: "",
         units: "service DID (66 hex characters)",
         what: "The ESP mint's DID: the 33-byte compressed key of esp-mint's mint_did_key.json (`esp-mint pubkey` prints it), in hex. Where the requests to the ESP mint are sealed, and the key its replies must be signed by. Required by serve, with air.server and air.host: AIR is the only way fsp-mint reaches the ESP mint, and it has no built-in DID.",
+        reload: false,
     },
     Spec {
         key: "air.esp_server",
@@ -190,6 +214,7 @@ pub const SPECS: &[Spec] = &[
         default: "",
         units: "AIR server name (66 hex characters)",
         what: "The name of the AIR server that carries the requests to the ESP mint (the SPI's): its public key, the compressed hex AIR prints (66 characters, starting 02 or 03). fsp-mint checks the server's signed challenge against it. To be replaced by DID resolution: resolving a mint's DID to its AIR server is not built (ROADMAP upstream item 4), so it is configuration for now. With air.esp_host and air.esp_did, it is how the three calls to the ESP mint (mint info, keysets, transfer) are made: all three are required by serve. This is not the server this mint's own listener is on (air.server).",
+        reload: false,
     },
     Spec {
         key: "air.esp_host",
@@ -197,6 +222,7 @@ pub const SPECS: &[Spec] = &[
         default: "",
         units: "host name or IP, no port",
         what: "Where that AIR server is: a host name or an IP with no scheme, no path and no port (the AIR client always dials port 5702 for ws). 127.0.0.1 for a server on this machine. To be replaced by DID resolution, like air.esp_server. Required by serve, with air.esp_server and air.esp_did.",
+        reload: false,
     },
     Spec {
         key: "air.server",
@@ -204,6 +230,7 @@ pub const SPECS: &[Spec] = &[
         default: "",
         units: "AIR server name (66 hex characters)",
         what: "The AIR server this mint's own listener holds reads on and writes replies to: its identity, a public key in AIR's compressed hex form (66 characters). The listener checks the server's signed challenge against it. Required by serve: the AIR listener always runs, because AIR is the only way wallets reach this mint. It is the AIR server of the service (it may be the same server as air.esp_server, or another: the DIDs differ, so the mailboxes do). To be replaced by DID resolution: a wallet is given this name beside the service's DID (its per-service `air.fsp` setting) until the AIR resolves a DID to a server (ROADMAP upstream item 4).",
+        reload: false,
     },
     Spec {
         key: "air.host",
@@ -211,6 +238,7 @@ pub const SPECS: &[Spec] = &[
         default: "",
         units: "host name or IP, no port",
         what: "Where that AIR server is: a host name or an IP (127.0.0.1 for a server on this machine). No port: the AIR client always uses 5702 (ws). Required by serve, with air.server. To be replaced by DID resolution, like air.server.",
+        reload: false,
     },
     Spec {
         key: "air.held_reads",
@@ -218,6 +246,7 @@ pub const SPECS: &[Spec] = &[
         default: "16",
         units: "reads",
         what: "How many mailbox slots the listener holds a read on, ahead of the next unfinished one. More lets more wallets be answered at once without waiting for a slot to be reached; each held read costs the AIR server about 2 KB. The AIR server closes the whole session at its 257th held read, so the most accepted is 200. The requests themselves are answered one at a time, in slot order. 1 to 200.",
+        reload: false,
     },
     Spec {
         key: "air.reply_wait_secs",
@@ -225,6 +254,7 @@ pub const SPECS: &[Spec] = &[
         default: "30",
         units: "seconds (1 to 600)",
         what: "How long to wait for the ESP mint's reply to one try of a request. After that the same request is written again, in the next free mailbox slot.",
+        reload: false,
     },
     Spec {
         key: "air.attempts",
@@ -232,6 +262,7 @@ pub const SPECS: &[Spec] = &[
         default: "3",
         units: "tries (1 to 10)",
         what: "How many tries one call makes before it gives up. A transfer that gets no reply leaves the issue pending (502 issuer_unavailable): its request is kept in issues.json, and sending the same issue request again carries on with it and picks up a late reply, without writing a second request.",
+        reload: false,
     },
     Spec {
         key: "air.max_skew_secs",
@@ -239,6 +270,7 @@ pub const SPECS: &[Spec] = &[
         default: "300",
         units: "seconds (1 to 86400)",
         what: "How far the reply's issued_at (the ESP mint's clock) may be from this mint's clock before the reply is refused as stale. A kept request answered later than this is dropped and the same transfer is sent in a new request (the ESP mint answers it from its stored answer).",
+        reload: false,
     },
     Spec {
         key: "air.timeout_secs",
@@ -246,6 +278,7 @@ pub const SPECS: &[Spec] = &[
         default: "10",
         units: "seconds (1 to 600)",
         what: "How long the AIR server may take to answer one Create or Read before that step fails (the calls to the ESP mint and this mint's own listener alike).",
+        reload: false,
     },
     Spec {
         key: "storage.mint_state",
@@ -253,6 +286,7 @@ pub const SPECS: &[Spec] = &[
         default: "",
         units: "service DIDs (66 hex characters)",
         what: "Which AIR services keep this mint's state (keys, spent lists, records), as an ordered list of service IDs: index 0 is the primary and the rest are secondaries, in the order they would be promoted. A service ID is the service's AIR DID, a 33-byte compressed key in hex (66 characters, starting 02 or 03); the old 32-byte x-only form is refused. In the environment the IDs are separated by commas; in the file it is an array of strings or one such string. One entry: that service holds the state and the mint keeps a local backup copy. Empty (the default): local only. At most 8, no duplicates. Setting only for now: nothing reads or writes the AIR yet (see DESIGN.md in sandbox-mint, \"AIR storage requirements\").",
+        reload: false,
     },
 ];
 
@@ -731,6 +765,91 @@ pub fn load(data_dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Loa
     }
 }
 
+/// What a reload did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reloaded {
+    /// The settings now in use, one line each (as at startup).
+    pub lines: Vec<String>,
+    /// The settings that reload live whose value changed.
+    pub changed: Vec<&'static str>,
+    /// The settings that need a restart whose file or environment value differs
+    /// from the running one. They keep their running value.
+    pub needs_restart: Vec<&'static str>,
+}
+
+/// The settings in use, which a reload can replace. Readers take a snapshot with
+/// [`ConfigCell::current`] and use it for one request, so a request never sees
+/// half of a reload.
+#[derive(Debug)]
+pub struct ConfigCell {
+    current: RwLock<Arc<Config>>,
+}
+
+impl ConfigCell {
+    pub fn new(config: Config) -> Self {
+        ConfigCell {
+            current: RwLock::new(Arc::new(config)),
+        }
+    }
+
+    /// The settings in use now.
+    pub fn current(&self) -> Arc<Config> {
+        match self.current.read() {
+            Ok(guard) => Arc::clone(&guard),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    /// Read the settings again from `base` (the same file and environment as at
+    /// startup) and put the ones that reload live into use. A value that needs a
+    /// restart is not applied: the running value is kept and the key is returned
+    /// in [`Reloaded::needs_restart`]. If the new settings are not valid, nothing
+    /// changes and the problems are returned.
+    pub fn reload(
+        &self,
+        base: &Path,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Reloaded, Vec<String>> {
+        let loaded = load(base, env)?;
+        let running = self.current();
+        let mut next = (*running).clone();
+        let (mut changed, mut needs_restart) = (Vec::new(), Vec::new());
+        for spec in SPECS {
+            let (old, new) = (running.get(spec.key), loaded.config.get(spec.key));
+            if old == new {
+                continue;
+            }
+            if spec.reload {
+                // A live setting is a whole number: it was parsed by `load`, so
+                // setting it again cannot fail.
+                if let Some(value) = new {
+                    next.set(spec.key, &value)
+                        .map_err(|e| vec![format!("{}: {e}", spec.key)])?;
+                }
+                changed.push(spec.key);
+            } else {
+                needs_restart.push(spec.key);
+            }
+        }
+        next.validate()?;
+        let lines = Loaded {
+            config: next.clone(),
+            sources: loaded.sources,
+            file: loaded.file,
+        }
+        .describe();
+        match self.current.write() {
+            Ok(mut guard) => *guard = Arc::new(next),
+            Err(poisoned) => *poisoned.into_inner() = Arc::new(next),
+        }
+        Ok(Reloaded {
+            lines,
+            changed,
+            needs_restart,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1090,5 +1209,44 @@ mod tests {
     #[test]
     fn issue_fee_per_byte_past_its_cap_is_refused_at_load() {
         refused_at_load("fees.issue_fee_per_byte", 30_000_001, "0 to 30000000");
+    }
+
+    #[test]
+    fn a_reload_applies_the_live_settings_keeps_the_restart_ones_and_refuses_a_bad_file() {
+        let d = dir("reload");
+        let none = env_of(&[]);
+        let cell = ConfigCell::new(load(&d, &none).unwrap().config);
+        assert_eq!(cell.current().issue_fee_per_byte, 0);
+
+        fs::write(
+            d.join(FILE_NAME),
+            "[fees]\nissue_fee_per_byte = 12\n[server]\nbind = \"127.0.0.1:3999\"\n",
+        )
+        .unwrap();
+        let r = cell.reload(&d, &none).unwrap();
+        assert_eq!(r.changed, vec!["fees.issue_fee_per_byte"]);
+        assert_eq!(r.needs_restart, vec!["server.bind"]);
+        assert_eq!(cell.current().issue_fee_per_byte, 12);
+        assert_eq!(cell.current().bind, "127.0.0.1:3200");
+        assert!(
+            r.lines
+                .contains(&"  fees.issue_fee_per_byte = 12 units/byte (file)".to_string()),
+            "{:?}",
+            r.lines
+        );
+
+        // The same file again: the restart-only change is still pending and named.
+        let r = cell.reload(&d, &none).unwrap();
+        assert!(r.changed.is_empty());
+        assert_eq!(r.needs_restart, vec!["server.bind"]);
+
+        // A bad file changes nothing.
+        fs::write(d.join(FILE_NAME), "[fees]\nissue_fee_per_byte = 31000000\n").unwrap();
+        let problems = cell.reload(&d, &none).unwrap_err();
+        assert!(
+            problems[0].contains("fees.issue_fee_per_byte = 31000000"),
+            "{problems:?}"
+        );
+        assert_eq!(cell.current().issue_fee_per_byte, 12);
     }
 }

@@ -167,7 +167,9 @@ pub fn load_first_issue(data_dir: &Path) -> io::Result<Option<u64>> {
 }
 
 /// Record the first issuance at `now`, once: if the file exists, it is left as
-/// it is and its time returned. Never changed afterwards.
+/// it is and its time returned. Never changed afterwards. It is written whole
+/// ([`store::write_secret`]), so a crash never leaves an empty or half file that
+/// would stop the next start.
 pub fn record_first_issue(data_dir: &Path, now: u64) -> io::Result<u64> {
     if let Some(t) = load_first_issue(data_dir)? {
         return Ok(t);
@@ -378,6 +380,18 @@ mod tests {
         assert_eq!(load_first_issue(&d).unwrap(), None);
         assert_eq!(record_first_issue(&d, 500).unwrap(), 500);
         assert_eq!(record_first_issue(&d, 900).unwrap(), 500, "never changed");
+        // Fails if the temporary file is left behind or the record is readable
+        // by others.
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(d.join(FIRST_ISSUE_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         assert_eq!(load_first_issue(&d).unwrap(), Some(500));
         std::fs::write(d.join(FIRST_ISSUE_FILE), "junk").unwrap();
         let e = load_first_issue(&d).unwrap_err();

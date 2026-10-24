@@ -9,9 +9,11 @@
 //! - [`spend`]: the spend call (kind 12), the fast path, with the spent lists and their log.
 //! - [`esp_client`]: the calls to the ESP mint (the Issuer) and what they return.
 //! - [`esp_air`]: those calls over AIR, the only way this mint reaches the ESP mint.
-//! - [`export`]: `export-esp`, the kept ESP written as `sp_wire::esp::handover::Handover` files.
-//! - [`server`]: what the mint answers (an outcome function per call) and the one
-//!   HTTP route left, `GET /audit`.
+//! - [`export`]: `export-esp`, the kept ESP written as `sp_wire::esp::handover::Handover` files,
+//!   by the running `serve` (or by the command when none runs).
+//! - [`lock`]: the data folder's writer lock: one fsp-mint process writes it at a time.
+//! - [`server`]: what the mint answers (an outcome function per call) and the
+//!   HTTP routes left: `GET /audit`, `GET /health` and `POST /export-esp`.
 //! - [`air_listener`]: this mint's own AIR listener, the only way wallets reach it.
 
 pub mod air_listener;
@@ -23,6 +25,7 @@ pub mod esp_client;
 pub mod export;
 pub mod issue;
 pub mod keysets;
+pub mod lock;
 pub mod server;
 pub mod spend;
 pub mod store;

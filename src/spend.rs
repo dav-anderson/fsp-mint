@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -206,10 +206,13 @@ pub struct Spender {
     core: Arc<Mutex<Core>>,
     tx: Mutex<mpsc::Sender<Msg>>,
     broken: Arc<AtomicBool>,
-    /// `spend.max_items`; the default is only a default (see `config`).
-    max_items: usize,
-    /// `spend.max_memo_bytes`; likewise only a default here.
-    max_memo_bytes: usize,
+    /// `spend.max_items`; the default is only a default (see `config`). Atomic
+    /// because a reload (`SIGHUP`) changes it while spends are being checked.
+    max_items: AtomicUsize,
+    /// `spend.max_memo_bytes`; likewise only a default here, and likewise live.
+    max_memo_bytes: AtomicUsize,
+    /// `spend.max_batch`, which the writer thread reads before it takes each batch.
+    max_batch: Arc<AtomicUsize>,
 }
 
 /// Read a log. A last line that a crash left half written is cut off when
@@ -367,36 +370,56 @@ impl Spender {
         let core = Arc::new(Mutex::new(core));
         let broken = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
-        let (dir, c, b) = (
+        let max_batch = Arc::new(AtomicUsize::new(max_batch.max(1)));
+        let (dir, c, b, w_batch) = (
             data_dir.to_path_buf(),
             Arc::clone(&core),
             Arc::clone(&broken),
+            Arc::clone(&max_batch),
         );
         std::thread::Builder::new()
             .name("fsp-spend-writer".into())
-            .spawn(move || writer(rx, dir, max_batch.max(1), c, b))?;
+            .spawn(move || writer(rx, dir, w_batch, c, b))?;
         Ok(Spender {
             dir: data_dir.to_path_buf(),
             core,
             tx: Mutex::new(tx),
             broken,
-            max_items: crate::config::DEFAULT_MAX_ITEMS,
-            max_memo_bytes: crate::api::MAX_MEMO_BYTES,
+            max_items: AtomicUsize::new(crate::config::DEFAULT_MAX_ITEMS),
+            max_memo_bytes: AtomicUsize::new(crate::api::MAX_MEMO_BYTES),
+            max_batch,
         })
     }
 
     /// Set `spend.max_items`, the most notes in and the most outputs out of one
     /// spend. Call it right after `open`.
-    pub fn with_max_items(mut self, max_items: usize) -> Self {
-        self.max_items = max_items.max(1);
+    pub fn with_max_items(self, max_items: usize) -> Self {
+        self.set_max_items(max_items);
         self
+    }
+
+    /// Change `spend.max_items` while the mint runs (a reload). It applies to
+    /// the next spend checked.
+    pub fn set_max_items(&self, max_items: usize) {
+        self.max_items.store(max_items.max(1), Ordering::Relaxed);
     }
 
     /// Set `spend.max_memo_bytes`, the longest memo on a spend. Call it right
     /// after `open`.
-    pub fn with_max_memo_bytes(mut self, max_memo_bytes: usize) -> Self {
-        self.max_memo_bytes = max_memo_bytes;
+    pub fn with_max_memo_bytes(self, max_memo_bytes: usize) -> Self {
+        self.set_max_memo_bytes(max_memo_bytes);
         self
+    }
+
+    /// Change `spend.max_memo_bytes` while the mint runs (a reload).
+    pub fn set_max_memo_bytes(&self, max_memo_bytes: usize) {
+        self.max_memo_bytes.store(max_memo_bytes, Ordering::Relaxed);
+    }
+
+    /// Change `spend.max_batch` while the mint runs (a reload). The writer reads
+    /// it before it takes each batch.
+    pub fn set_max_batch(&self, max_batch: usize) {
+        self.max_batch.store(max_batch.max(1), Ordering::Relaxed);
     }
 
     /// Why the spend path is stopped, if it is.
@@ -494,14 +517,14 @@ impl Spender {
         if request.inputs.is_empty() {
             return Err(refuse("no_inputs", "a spend needs at least one note"));
         }
-        let max = self.max_items;
+        let max = self.max_items.load(Ordering::Relaxed);
         if request.inputs.len() > max || request.outputs.len() > max {
             return Err(refuse(
                 "too_many_items",
                 format!("at most {max} notes and {max} outputs"),
             ));
         }
-        let max_memo = self.max_memo_bytes;
+        let max_memo = self.max_memo_bytes.load(Ordering::Relaxed);
         if request.memo.len() > max_memo {
             return Err(refuse(
                 "memo_too_long",
@@ -760,7 +783,7 @@ impl Spender {
 fn writer(
     rx: mpsc::Receiver<Msg>,
     dir: PathBuf,
-    max_batch: usize,
+    max_batch: Arc<AtomicUsize>,
     core: Arc<Mutex<Core>>,
     broken: Arc<AtomicBool>,
 ) {
@@ -768,7 +791,8 @@ fn writer(
     loop {
         let Ok(first) = rx.recv() else { return };
         let mut batch = vec![first];
-        while batch.len() < max_batch {
+        let limit = max_batch.load(Ordering::Relaxed).max(1);
+        while batch.len() < limit {
             match rx.try_recv() {
                 Ok(m) => batch.push(m),
                 Err(_) => break,

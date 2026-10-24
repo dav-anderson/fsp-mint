@@ -30,12 +30,13 @@ use esp_mint::server::EspState;
 use esp_mint::terms::Terms;
 use fsp_mint::api::*;
 use fsp_mint::audit::{self, Report};
-use fsp_mint::config::Config;
+use fsp_mint::config::{Config, ConfigCell};
 use fsp_mint::esp_air::AirIssuer;
 use fsp_mint::esp_client::Issuer;
-use fsp_mint::export::export_esp;
+use fsp_mint::export;
 use fsp_mint::issue::{Entry, IssueData, Issues, KeptEsp};
 use fsp_mint::keysets::Keyset;
+use fsp_mint::lock::DataLock;
 use fsp_mint::server::{self, FspState};
 use fsp_mint::spend::Spender;
 use fsp_mint::store;
@@ -46,7 +47,7 @@ use sp_wire::ServiceDid;
 use sp_wire::air_request::addr;
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
 use sp_wire::esp::exchange::ExchangeResponse;
-use sp_wire::esp::handover::Handover;
+use sp_wire::esp::handover::{HandedNote, Handover};
 use sp_wire::seal::SecretKey as DidKey;
 use tokio::runtime::Runtime;
 
@@ -426,7 +427,8 @@ fn start_fsp_with(
     let issuer = AirIssuer::new(&cfg).unwrap();
     let c = Arc::clone(&clock);
     let state = Arc::new(FspState {
-        config: cfg,
+        config: ConfigCell::new(cfg),
+        data_dir: dir.join("fsp"),
         spender,
         issues: Mutex::new(issues),
         issuer: Box::new(issuer),
@@ -1477,6 +1479,15 @@ fn a_key_set_deleted_before_its_counters_were_saved_is_folded_at_the_next_start(
 // ---- export-esp ----
 
 /// A kept ESP note as `issues.json` holds it (real types, not JSON text).
+/// What `export-esp` does when no `serve` is running: take the data folder's
+/// lock, open `issues.json`, export, and move the files to `out`.
+fn export_direct(data: &Path, out: &Path, now: u64) -> Result<Vec<(PathBuf, usize)>, String> {
+    let _lock = DataLock::acquire(data).map_err(|e| e.to_string())?;
+    let mut issues = Issues::open(data).map_err(|e| e.to_string())?;
+    export::export_kept(&mut issues, &export::folder(data), service(), now)?;
+    export::deliver(&export::folder(data), out)
+}
+
 fn kept(amount: u64, day: u64, keyset: &str, request: &str) -> KeptEsp {
     let kp = Keypair::new(SECP256K1, &mut OsRng);
     KeptEsp {
@@ -1515,12 +1526,33 @@ fn export_esp_writes_a_handover_file_for_each_day_once_and_the_audit_still_count
     );
     assert_eq!(units(&before.esp_reserve.total.exported_esp), 0);
 
-    // One file for each day, in the folder the export makes.
+    // One file for each day. The running mint makes them (under the lock an
+    // issue also holds), in its export folder, and the command moves them to
+    // the folder it was given.
+    let (status, body) = server::export_outcome(&f.state, 1_234);
+    assert_eq!(status.as_u16(), 200, "{body}");
+    assert_eq!(
+        body,
+        serde_json::json!({"files": [
+            {"name": format!("esp-{day1}-1234.json"), "notes": 2},
+            {"name": format!("esp-{day2}-1234.json"), "notes": 1},
+        ]})
+    );
     let out = scratch("export-out").join("handover");
-    let written = export_esp(&data, &out, service(), 1_234).unwrap();
+    let written = export::deliver(&export::folder(&data), &out).unwrap();
     let file1 = out.join(format!("esp-{day1}-1234.json"));
     let file2 = out.join(format!("esp-{day2}-1234.json"));
     assert_eq!(written, vec![(file1.clone(), 2), (file2.clone(), 1)]);
+    // The notes carry spend secrets: the folder and the files are the owner's alone.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&out), 0o700);
+        assert_eq!(mode(&file1), 0o600);
+        assert_eq!(mode(&file2), 0o600);
+    }
+    // Moved, not copied: nothing is left in the mint's export folder.
+    assert_eq!(std::fs::read_dir(export::folder(&data)).unwrap().count(), 0);
 
     // Each file reads back as the hand-over type, with the service, the day and
     // every note with the ESP keyset that signed it.
@@ -1551,8 +1583,14 @@ fn export_esp_writes_a_handover_file_for_each_day_once_and_the_audit_still_count
 
     // The notes are marked exported, and a second run writes nothing.
     assert!(kept_now.iter().all(|k| k.exported));
-    let again = export_esp(&data, &out, service(), 1_235).unwrap();
-    assert!(again.is_empty(), "{again:?}");
+    let (status, again) = server::export_outcome(&f.state, 1_235);
+    assert_eq!(status.as_u16(), 200, "{again}");
+    assert_eq!(again, serde_json::json!({"files": []}));
+    assert!(
+        export::deliver(&export::folder(&data), &out)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2);
 
     // The audit counts the exported ESP as before, and shows it as exported.
@@ -1586,7 +1624,7 @@ fn export_esp_refuses_a_kept_note_with_no_keyset_and_names_it_before_writing_any
     };
     write(vec![old.clone(), new.clone()]);
 
-    let e = export_esp(&data, &out, service(), 1_234).unwrap_err();
+    let e = export_direct(&data, &out, 1_234).unwrap_err();
     assert_eq!(
         e,
         format!(
@@ -1597,6 +1635,7 @@ fn export_esp_refuses_a_kept_note_with_no_keyset_and_names_it_before_writing_any
     // Nothing was written, and no note was marked exported (the one with a
     // keyset, on another day, included).
     assert!(!out.exists());
+    assert_eq!(std::fs::read_dir(export::folder(&data)).unwrap().count(), 0);
     let after: IssueData = store::load(&issues).unwrap().unwrap();
     assert_eq!(after.kept.len(), 2);
     assert!(after.kept.iter().all(|k| !k.exported));
@@ -1605,7 +1644,7 @@ fn export_esp_refuses_a_kept_note_with_no_keyset_and_names_it_before_writing_any
     let mut filled = old.clone();
     filled.keyset = "0a0b0c0d0e0f1011".into();
     write(vec![filled, new]);
-    let written = export_esp(&data, &out, service(), 1_234).unwrap();
+    let written = export_direct(&data, &out, 1_234).unwrap();
     assert_eq!(
         written,
         vec![
@@ -1613,6 +1652,520 @@ fn export_esp_refuses_a_kept_note_with_no_keyset_and_names_it_before_writing_any
             (out.join("esp-20501-1234.json"), 1)
         ]
     );
+}
+
+/// Every note of every hand-over file in `files`, as (nonce hex, amount).
+fn notes_in(files: &[(PathBuf, usize)]) -> Vec<(String, u64)> {
+    let mut all = Vec::new();
+    for (file, count) in files {
+        let handover = Handover::read(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(handover.notes.len(), *count, "{}", file.display());
+        for n in handover.notes {
+            all.push((hex::encode(n.note.nonce.0.serialize()), n.amount));
+        }
+    }
+    all
+}
+
+/// `export-esp` asks the running mint, which exports under the lock an issue also
+/// holds. Issues arrive on one thread while the export runs again and again on
+/// this one: every note kept is exported once (none missed, none twice), and the
+/// files together hold exactly the notes `issues.json` keeps.
+#[test]
+fn export_esp_while_issues_keep_arriving_exports_every_note_once() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("export-live");
+    let (esp_at, esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_at, "0");
+    let data = dir.join("fsp");
+    let day1 = Terms::new_at(service(), NOW).redeemable_after_day;
+    let requests: Vec<IssueRequest> = (0..8u32)
+        .map(|i| {
+            one_group(
+                &esp,
+                1 << (i % 4),
+                if i % 2 == 0 { day1 } else { day1 + 30 },
+            )
+        })
+        .collect();
+    let state = Arc::clone(&f.state);
+    let issuing = thread::spawn(move || {
+        for request in &requests {
+            let (status, body) = server::run_issue(&state, request);
+            assert_eq!(status.as_u16(), 200, "{body}");
+        }
+    });
+    let out = scratch("export-live-out");
+    let mut delivered = Vec::new();
+    let mut round = 0;
+    loop {
+        // Read before the export: the last round starts after the issues ended.
+        let finished = issuing.is_finished();
+        round += 1;
+        let (status, body) = server::export_outcome(&f.state, 5_000 + round);
+        assert_eq!(status.as_u16(), 200, "{body}");
+        delivered.extend(export::deliver(&export::folder(&data), &out).unwrap());
+        if finished {
+            break;
+        }
+    }
+    issuing.join().unwrap();
+
+    let exported = notes_in(&delivered);
+    let kept = issues_file(&dir).kept;
+    assert_eq!(kept.len(), 8, "every issue kept its note");
+    assert!(
+        kept.iter().all(|k| k.exported),
+        "a kept note was not exported"
+    );
+    let mut seen: Vec<&String> = exported.iter().map(|(n, _)| n).collect();
+    seen.sort();
+    let before = seen.len();
+    seen.dedup();
+    assert_eq!(seen.len(), before, "a note was exported twice");
+    let mut want: Vec<String> = kept
+        .iter()
+        .map(|k| hex::encode(k.note.nonce.0.serialize()))
+        .collect();
+    want.sort();
+    assert_eq!(seen.into_iter().cloned().collect::<Vec<_>>(), want);
+    // 1, 2, 4, 8 twice over.
+    assert_eq!(exported.iter().map(|(_, a)| a).sum::<u64>(), 30);
+}
+
+/// A crash between the files and the marks, or between the marks and the final
+/// names, leaves `.part` files. The next export settles them: a file whose notes
+/// are marked exported is finished (the notes are not lost), a file whose notes
+/// are not marked is deleted (the notes are exported once, now).
+#[test]
+fn export_esp_settles_the_part_files_a_crash_left_and_loses_and_repeats_nothing() {
+    let data = scratch("export-crash");
+    let out = scratch("export-crash-out").join("handover");
+    let (mut marked, unmarked) = (
+        kept(4, 20_500, "0102030405060708", "r1"),
+        kept(2, 20_501, "0102030405060708", "r2"),
+    );
+    marked.exported = true;
+    store::save(
+        &data.join("issues.json"),
+        &IssueData {
+            kept: vec![marked.clone(), unmarked.clone()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let folder = export::folder(&data);
+    std::fs::create_dir_all(&folder).unwrap();
+    let part = |k: &KeptEsp, name: &str| {
+        store::save_private(
+            &folder.join(name),
+            &Handover {
+                service: service(),
+                redeemable_after_day: k.redeemable_after_day,
+                notes: vec![HandedNote {
+                    amount: k.amount,
+                    note: k.note,
+                    spend_secret: k.spend_secret,
+                    keyset: k.keyset.clone(),
+                }],
+            },
+        )
+        .unwrap()
+    };
+    // The marks were saved, the rename was not: finish it.
+    part(&marked, "esp-20500-1.json.part");
+    // The marks were not saved: the file is a draft.
+    part(&unmarked, "esp-20501-1.json.part");
+
+    let written = export_direct(&data, &out, 2_000).unwrap();
+    assert_eq!(
+        written,
+        vec![
+            (out.join("esp-20500-1.json"), 1),
+            (out.join("esp-20501-2000.json"), 1)
+        ]
+    );
+    let notes = notes_in(&written);
+    assert_eq!(
+        notes,
+        vec![
+            (hex::encode(marked.note.nonce.0.serialize()), 4),
+            (hex::encode(unmarked.note.nonce.0.serialize()), 2),
+        ]
+    );
+    assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0);
+    assert!(
+        issues_file_at(&data).kept.iter().all(|k| k.exported),
+        "the unmarked note is marked now"
+    );
+    // And nothing more to write.
+    assert!(export_direct(&data, &out, 2_001).unwrap().is_empty());
+}
+
+/// The route takes no path and no body, and answers a read with `405`.
+#[test]
+fn the_export_route_is_a_post_with_no_path_and_a_get_is_refused() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("export-route");
+    let (esp_at, esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_at, "0");
+    let day = Terms::new_at(service(), NOW).redeemable_after_day;
+    issue_one(&esp, &f, 4, day);
+    let http = reqwest::blocking::Client::new();
+    let r = http.get(format!("{}/export-esp", f.http)).send().unwrap();
+    assert_eq!(r.status().as_u16(), 405, "GET /export-esp");
+    assert!(
+        issues_file(&dir).kept.iter().all(|k| !k.exported),
+        "a GET exported"
+    );
+    let r = http.post(format!("{}/export-esp", f.http)).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let body: serde_json::Value = r.json().unwrap();
+    assert_eq!(body["files"].as_array().unwrap().len(), 1);
+    // The file is in the mint's own export folder, whatever the caller sent.
+    let name = body["files"][0]["name"].as_str().unwrap();
+    assert!(export::folder(&dir.join("fsp")).join(name).is_file());
+}
+
+/// The real program, with the data folder's lock held as `serve` holds it: it does
+/// not open `issues.json`, it asks the running mint over its loopback route, and
+/// the files end up in `--out`, owner-only. With nothing answering on the bind it
+/// says so and changes nothing.
+#[test]
+fn the_export_esp_command_asks_the_running_serve_and_says_so_when_nothing_answers() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("export-cli");
+    let (esp_at, esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_at, "0");
+    let day = Terms::new_at(service(), NOW).redeemable_after_day;
+    issue_one(&esp, &f, 4, day);
+    issue_one(&esp, &f, 2, day);
+    // The program's data folder is <FSP_DATA_DIR>/main.
+    std::os::unix::fs::symlink(dir.join("fsp"), dir.join("main")).unwrap();
+    let held = DataLock::acquire(&dir.join("fsp")).unwrap();
+    let did = service().to_string();
+    let bind = f.http.trim_start_matches("http://").to_string();
+    let out = scratch("export-cli-out").join("handover");
+    let run = |bind: &str, out: &Path| {
+        fsp_run(
+            &dir,
+            &["export-esp", "--out", out.to_str().unwrap()],
+            &[("FSP_SERVICE_DID", did.as_str()), ("FSP_BIND", bind)],
+        )
+    };
+
+    let r = run(&bind, &out);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&r.stdout).to_string(),
+        String::from_utf8_lossy(&r.stderr).to_string(),
+    );
+    assert!(r.status.success(), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("fsp-mint serve is running: asking it to export"),
+        "{stdout}"
+    );
+    let file = out.join(format!("esp-{day}-{}.json", NOW));
+    assert!(
+        stdout.contains(&format!("wrote {} (2 notes)", file.display())),
+        "{stdout}"
+    );
+    let handover = Handover::read(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(
+        handover.notes.iter().map(|n| n.amount).collect::<Vec<_>>(),
+        vec![4, 2]
+    );
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&out), mode(&file)), (0o700, 0o600));
+    }
+    assert!(issues_file(&dir).kept.iter().all(|k| k.exported));
+
+    // A second run has nothing to write.
+    let again = run(&bind, &out);
+    assert!(again.status.success());
+    assert!(String::from_utf8_lossy(&again.stdout).contains("no ESP to export"));
+
+    // A port nothing listens on: the error says the folder is in use and nothing
+    // answers; nothing was changed.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_bind = dead.local_addr().unwrap().to_string();
+    drop(dead);
+    issue_one(&esp, &f, 8, day);
+    let r = run(&dead_bind, &scratch("export-cli-out2").join("h"));
+    let err = String::from_utf8_lossy(&r.stderr).to_string();
+    assert!(!r.status.success());
+    assert!(
+        err.contains("in use by another fsp-mint")
+            && err.contains(&format!("nothing answers at {dead_bind}")),
+        "{err}"
+    );
+    assert_eq!(
+        issues_file(&dir)
+            .kept
+            .iter()
+            .filter(|k| !k.exported)
+            .count(),
+        1,
+        "the new note stays unexported"
+    );
+    drop(held);
+}
+
+/// Stopped `serve`: the same command does the export itself, and holds the lock
+/// while it does, so a `serve` cannot start in the middle. An `--out` folder that
+/// already exists open to others is made owner-only before a file goes in.
+#[test]
+fn the_export_esp_command_exports_by_itself_when_no_serve_is_running() {
+    let base = scratch("export-alone");
+    let data = base.join("main");
+    std::fs::create_dir_all(&data).unwrap();
+    let note = kept(4, 20_500, "0102030405060708", "r1");
+    store::save(
+        &data.join("issues.json"),
+        &IssueData {
+            kept: vec![note.clone()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let did = service().to_string();
+    let out = base.join("handover");
+    std::fs::create_dir(&out).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let r = fsp_run(
+        &base,
+        &["export-esp", "--out", out.to_str().unwrap()],
+        &[("FSP_SERVICE_DID", did.as_str())],
+    );
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&r.stdout).to_string(),
+        String::from_utf8_lossy(&r.stderr).to_string(),
+    );
+    assert!(r.status.success(), "{stdout}{stderr}");
+    assert!(!stdout.contains("asking it to export"), "{stdout}");
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
+    // Fails if an existing folder is left open to others.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&out).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+    assert!(issues_file_at(&data).kept[0].exported);
+    // The lock is not held after the command.
+    drop(DataLock::acquire(&data).expect("the command released the lock"));
+}
+
+/// `--serve-only` (what aso's redeem job runs, as root): with no `serve`
+/// answering it fails, says nothing was exported, and does not take the lock or
+/// open the data, so no file in the data folder is made or changed, whoever runs
+/// it. A mistyped flag is refused, never taken as "export by yourself".
+#[test]
+fn the_export_esp_command_with_serve_only_never_touches_the_data_folder() {
+    let base = scratch("export-serve-only");
+    let data = base.join("main");
+    std::fs::create_dir_all(&data).unwrap();
+    let note = kept(4, 20_500, "0102030405060708", "r1");
+    let issues = IssueData {
+        kept: vec![note.clone()],
+        ..Default::default()
+    };
+    store::save(&data.join("issues.json"), &issues).unwrap();
+    let before = std::fs::read(data.join("issues.json")).unwrap();
+    let did = service().to_string();
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_bind = dead.local_addr().unwrap().to_string();
+    drop(dead);
+    let out = base.join("handover");
+    let r = fsp_run(
+        &base,
+        &["export-esp", "--out", out.to_str().unwrap(), "--serve-only"],
+        &[("FSP_SERVICE_DID", did.as_str()), ("FSP_BIND", &dead_bind)],
+    );
+    let err = String::from_utf8_lossy(&r.stderr).to_string();
+    assert!(!r.status.success(), "it exported with no serve");
+    assert!(
+        err.contains(&format!(
+            "export-esp --serve-only: fsp-mint serve is not answering at {dead_bind}: "
+        )) && err.contains("Nothing was exported and the data folder was not touched"),
+        "{err}"
+    );
+    // Fails if the command took the lock or wrote the data: issues.json alone,
+    // unchanged, and no --out folder.
+    let names: Vec<_> = std::fs::read_dir(&data)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, vec!["issues.json".to_string()]);
+    assert_eq!(std::fs::read(data.join("issues.json")).unwrap(), before);
+    assert!(!out.exists());
+
+    let r = fsp_run(
+        &base,
+        &["export-esp", "--out", out.to_str().unwrap(), "--serve_only"],
+        &[("FSP_SERVICE_DID", did.as_str()), ("FSP_BIND", &dead_bind)],
+    );
+    assert!(!r.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&r.stderr),
+        "error: export-esp does not take `--serve_only`\n"
+    );
+    assert_eq!(std::fs::read_dir(&data).unwrap().count(), 1);
+}
+
+// ---- reload (SIGHUP) -----------------------------------------------------------
+
+/// A settings file holding every setting at its running value, as strings, with
+/// `changes` applied.
+fn settings_text(state: &FspState, changes: &[(&str, &str)]) -> String {
+    let running = state.config.current();
+    let mut sections: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for spec in fsp_mint::config::SPECS {
+        let value = changes
+            .iter()
+            .find(|(k, _)| *k == spec.key)
+            .map(|(_, v)| v.to_string())
+            .or_else(|| running.get(spec.key))
+            .unwrap();
+        let (section, name) = spec.key.split_once('.').unwrap();
+        sections
+            .entry(section.to_string())
+            .or_default()
+            .push(format!("{name} = \"{value}\""));
+    }
+    sections
+        .into_iter()
+        .map(|(section, lines)| format!("[{section}]\n{}\n", lines.join("\n")))
+        .collect()
+}
+
+/// `SIGHUP` reads the settings again: the fee and the limits change for the next
+/// request, in the mint and in what it serves on fees; a setting that needs a
+/// restart keeps its running value and is named; settings that are not valid
+/// change nothing.
+#[test]
+fn a_reload_changes_the_fee_and_the_limits_for_the_next_request_and_names_what_needs_a_restart() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("reload");
+    let (esp_at, _esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_at, "0");
+    let state = &f.state;
+    let base = scratch("reload-settings");
+    let no_env = |_: &str| -> Option<String> { None };
+    let k = current(&f);
+    let first = fsp_note(&k, 2);
+    let second = fsp_note(&k, 2);
+    let held = vec![(first.0, first.1, 2)];
+    let held_second = vec![(second.0, second.1, 2)];
+    let spends = |notes: &[(Note, SecretKey, u64)]| {
+        let req = spend_request(&k.id, notes, &[Out::new(1).mint()], 1);
+        Runtime::new()
+            .unwrap()
+            .block_on(state.spender.spend(&req, NOW))
+    };
+
+    // As started: the defaults, and a 7-byte memo is within the 256.
+    let fees =
+        || -> FeesResponse { serde_json::from_value(server::fees_outcome(state).1).unwrap() };
+    assert_eq!(fees().issue_fee_per_byte, 0);
+    assert!(spends(&held).is_ok());
+
+    // New values for every setting that reloads live, and for two that do not.
+    std::fs::write(
+        base.join("fsp-mint.toml"),
+        settings_text(
+            state,
+            &[
+                ("fees.issue_fee_per_byte", "7"),
+                ("issue.max_items", "64"),
+                ("spend.max_items", "64"),
+                ("spend.max_memo_bytes", "4"),
+                ("spend.max_batch", "2"),
+                ("server.max_request_bytes", "20000"),
+                ("esp.keyset_ttl_secs", "5"),
+                ("server.bind", "127.0.0.1:3299"),
+                ("rotation.period_hours", "99"),
+            ],
+        ),
+    )
+    .unwrap();
+    let r = server::reload(state, &base, &no_env).unwrap();
+    assert_eq!(
+        r.changed,
+        vec![
+            "server.max_request_bytes",
+            "fees.issue_fee_per_byte",
+            "issue.max_items",
+            "spend.max_items",
+            "spend.max_memo_bytes",
+            "spend.max_batch",
+            "esp.keyset_ttl_secs",
+        ]
+    );
+    assert_eq!(
+        r.needs_restart,
+        vec!["server.bind", "rotation.period_hours"]
+    );
+
+    // What it serves, and what it enforces, for the next request.
+    let served = fees();
+    assert_eq!(served.issue_fee_per_byte, 7);
+    assert_eq!(served.max_request_bytes, 20_000);
+    assert_eq!(served.issue_max_items, Some(64));
+    assert_eq!(served.spend_max_items, Some(64));
+    assert_eq!(served.spend_max_memo_bytes, Some(4));
+    let e = spends(&held_second).unwrap_err();
+    assert_eq!(e.code, "memo_too_long", "the 7-byte memo is over the new 4");
+    assert!(
+        !state
+            .spender
+            .is_spent(&k.id, &held_second[0].0.nonce.0.serialize())
+    );
+    let many: Vec<_> = (0..65)
+        .map(|_| {
+            let (n, s) = fsp_note(&k, 1);
+            (n, s, 1)
+        })
+        .collect();
+    let e = spends(&many).unwrap_err();
+    assert_eq!(e.code, "too_many_items");
+    assert!(e.why.contains("at most 64 notes"), "{}", e.why);
+
+    // The restart-only settings keep what the mint is running with.
+    let running = state.config.current();
+    assert_eq!(running.bind, "127.0.0.1:3200");
+    assert_eq!(running.rotation_period_hours, 240);
+
+    // Not valid: every problem is returned and nothing changes.
+    std::fs::write(
+        base.join("fsp-mint.toml"),
+        settings_text(
+            state,
+            &[
+                ("fees.issue_fee_per_byte", "999999999"),
+                ("spend.max_items", "63"),
+            ],
+        ),
+    )
+    .unwrap();
+    let problems = server::reload(state, &base, &no_env).unwrap_err();
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("fees.issue_fee_per_byte")),
+        "{problems:?}"
+    );
+    assert!(
+        problems.iter().any(|p| p.contains("spend.max_items")),
+        "{problems:?}"
+    );
+    assert_eq!(fees().issue_fee_per_byte, 7);
+    assert_eq!(fees().spend_max_items, Some(64));
 }
 
 // ---------------------------------------------------------------- over AIR
@@ -1641,7 +2194,12 @@ fn put(server: &ServerRef, key: &DidKey, bytes: Vec<u8>) -> client::Put {
 
 /// `issues.json` as the types that write it.
 fn issues_file(dir: &Path) -> IssueData {
-    serde_json::from_slice(&std::fs::read(dir.join("fsp").join("issues.json")).unwrap()).unwrap()
+    issues_file_at(&dir.join("fsp"))
+}
+
+/// `issues.json` in a data folder.
+fn issues_file_at(data: &Path) -> IssueData {
+    serde_json::from_slice(&std::fs::read(data.join("issues.json")).unwrap()).unwrap()
 }
 
 #[test]
@@ -1742,6 +2300,140 @@ fn an_esp_mint_that_does_not_answer_leaves_the_issue_pending_and_the_retry_finis
             .as_u64()
             .or(audit["redeemed"].as_str().and_then(|s| s.parse().ok())),
         Some(6),
+        "{audit}"
+    );
+}
+
+/// An upgrade of fsp-mint is a stop and a start on the same data folder
+/// (item 14). A wallet that keeps issuing and spending through it must see every
+/// request answered once: the one sent while fsp-mint is down waits in the AIR
+/// mailbox and the restarted listener answers it, and a request sent again
+/// afterwards gets the stored answer, with no change to the counters.
+///
+/// Fails if a request sent while fsp-mint was down is lost (the wallet's call
+/// panics on no reply), if a restart counts an issue or a spend twice (the audit
+/// and the spend log differ from the rounds made), or if a repeated request
+/// gets a new answer.
+#[test]
+fn an_upgrade_restart_while_a_wallet_issues_and_spends_loses_and_repeats_nothing() {
+    const ROUNDS: usize = 6;
+    const RESTART_BEFORE_ROUND: usize = 3;
+    struct Round {
+        issue: IssueRequest,
+        issued: serde_json::Value,
+        spend: SpendRequest,
+        spent: serde_json::Value,
+    }
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("upgrade");
+    let (esp_at, esp) = start_esp(&rt, &dir);
+    let f = start_fsp(&rt, &dir, &esp_at, "0");
+    // The wallet runs on a thread of its own, and the service key is this
+    // thread's: the DID and the AIR client are made here.
+    let did = service();
+    let day = Terms::new_at(did, NOW).redeemable_after_day;
+    let air = Air::new(&esp_at.server, did, "main");
+    let (half_tx, half_rx) = std::sync::mpsc::channel::<()>();
+    let (stopped_tx, stopped_rx) = std::sync::mpsc::channel::<()>();
+    let wallet = thread::spawn(move || {
+        let mut rounds = Vec::new();
+        for i in 0..ROUNDS {
+            if i == RESTART_BEFORE_ROUND {
+                // fsp-mint is stopped from here on: this round's first request
+                // is sent while no listener is answering.
+                half_tx.send(()).unwrap();
+                stopped_rx.recv().unwrap();
+            }
+            let out = Out::new(2);
+            let issue = IssueRequest {
+                service: did,
+                groups: vec![IssueGroup {
+                    redeemable_after_day: day,
+                    notes: vec![esp_note(&esp, 2, did, day)],
+                    outputs: vec![out.mint()],
+                }],
+            };
+            let (status, issued) = air.post_json("/issue", &issue);
+            assert_eq!(status, 200, "round {i}: {issued}");
+            let reply: IssueResponse = serde_json::from_value(issued.clone()).unwrap();
+            let GroupResult::Issued {
+                keyset,
+                signatures,
+                keys,
+                ..
+            } = &reply.groups[0]
+            else {
+                panic!("round {i}: not issued: {issued}")
+            };
+            let (note, secret) = out.note(&signatures[0], &keys[0]);
+            let spend = spend_request(keyset, &[(note, secret, 2)], &[Out::new(1).mint()], 1);
+            let (status, spent) = air.post_json("/spend", &spend);
+            assert_eq!(status, 200, "round {i}: {spent}");
+            assert_eq!(spent["paid"], 1, "round {i}: {spent}");
+            rounds.push(Round {
+                issue,
+                issued,
+                spend,
+                spent,
+            });
+        }
+        rounds
+    });
+
+    // The upgrade: stop fsp-mint once the wallet has made its first rounds, tell
+    // the wallet it may go on, and start it again on the same data folder.
+    half_rx.recv().unwrap();
+    drop(f);
+    stopped_tx.send(()).unwrap();
+    let f = start_fsp(&rt, &dir, &esp_at, "0");
+    let rounds = wallet.join().unwrap();
+    assert_eq!(rounds.len(), ROUNDS);
+
+    // Each round counted once: 2 issued, 1 paid and 1 back as change.
+    let ks = current(&f).id.clone();
+    let report = get_audit(&f);
+    let l = line(&report, &ks);
+    assert_eq!(
+        (
+            units(&l.issued),
+            units(&l.change),
+            units(&l.spent),
+            units(&l.outstanding)
+        ),
+        (12, 6, 12, 6)
+    );
+    assert_eq!(units(&report.fsp.paid), 6);
+    assert!(report.consistent, "{:?}", report.warnings);
+    assert_eq!(issues_file(&dir).kept.len(), ROUNDS);
+    let log =
+        std::fs::read_to_string(dir.join("fsp").join(fsp_mint::spend::log_name(&ks))).unwrap();
+    assert_eq!(log.lines().count(), ROUNDS, "one line per spend: {log:?}");
+
+    // Every request sent again, from before and after the restart, gets the
+    // answer it got, and nothing is counted again.
+    for (i, r) in rounds.iter().enumerate() {
+        assert_eq!(
+            f.post("/issue", &r.issue),
+            (200, r.issued.clone()),
+            "issue {i}"
+        );
+        assert_eq!(
+            f.post("/spend", &r.spend),
+            (200, r.spent.clone()),
+            "spend {i}"
+        );
+    }
+    assert_eq!(get_audit(&f).fsp, report.fsp);
+    // The ESP mint transferred each ESP note once: 6 x 2 units.
+    let audit: serde_json::Value = reqwest::blocking::get(format!("{}/audit", esp_at.url))
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(
+        audit["redeemed"]
+            .as_u64()
+            .or(audit["redeemed"].as_str().and_then(|s| s.parse().ok())),
+        Some(12),
         "{audit}"
     );
 }

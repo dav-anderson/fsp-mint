@@ -7,11 +7,12 @@
 //! routes left are the operator's `GET /audit` and the health monitor's `GET /health`,
 //! on `server.bind` (loopback only).
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use secp256k1::Keypair;
 use serde::de::DeserializeOwned;
@@ -22,13 +23,17 @@ use sp_wire::air_request::{
 };
 
 use crate::api::{FeesResponse, IssueRequest, KeysResponse, SpendRequest};
-use crate::config::Config;
+use crate::config::{ConfigCell, Reloaded};
 use crate::esp_client::Issuer;
 use crate::issue::{self, IssueContext, Issues};
 use crate::spend::Spender;
 
 pub struct FspState {
-    pub config: Config,
+    /// The settings in use. `SIGHUP` replaces the ones that reload live
+    /// ([`reload`]); each call reads one snapshot of them.
+    pub config: ConfigCell,
+    /// The network's data folder, which the export folder is in.
+    pub data_dir: PathBuf,
     pub spender: Spender,
     pub issues: Mutex<Issues>,
     pub issuer: Box<dyn Issuer>,
@@ -73,13 +78,14 @@ fn too_large_body(size: u64, limit: usize) -> Value {
 /// `GET /health`: the mint info. `ok` while the mint is sound, a `503` with the
 /// reason when the spend writer has failed (a signed "cannot answer now" over AIR).
 pub fn health_outcome(s: &FspState) -> Outcome {
-    let service = s.config.service().map(|k| k.to_string());
+    let cfg = s.config.current();
+    let service = cfg.service().map(|k| k.to_string());
     match s.spender.fault() {
         None => (
             StatusCode::OK,
             json!({
                 "status": "ok",
-                "network": s.config.network,
+                "network": cfg.network,
                 "service": service,
                 "wire_version": sp_wire::WIRE_VERSION,
             }),
@@ -89,7 +95,7 @@ pub fn health_outcome(s: &FspState) -> Outcome {
             json!({
                 "status": "broken",
                 "reason": why,
-                "network": s.config.network,
+                "network": cfg.network,
                 "service": service,
                 "wire_version": sp_wire::WIRE_VERSION,
             }),
@@ -109,7 +115,7 @@ pub fn keys_outcome(s: &FspState) -> Outcome {
     match s.spender.keysets(now) {
         Ok(live) => {
             let body = KeysResponse {
-                service: s.config.service(),
+                service: s.config.current().service(),
                 current: live.last().map(|k| k.id.clone()).unwrap_or_default(),
                 previous: (live.len() >= 2).then(|| live[live.len() - 2].id.clone()),
                 keysets: live
@@ -168,15 +174,16 @@ pub fn rotation_outcome(s: &FspState) -> Outcome {
 
 /// `GET /fees`.
 pub fn fees_outcome(s: &FspState) -> Outcome {
+    let cfg = s.config.current();
     let body = FeesResponse {
-        issue_fee_per_byte: s.config.issue_fee_per_byte,
+        issue_fee_per_byte: cfg.issue_fee_per_byte,
         issue_group_fixed_bytes: 16,
         issue_note_bytes: 106,
         issue_output_bytes: 41,
-        max_request_bytes: s.config.max_request_bytes,
-        issue_max_items: Some(s.config.issue_max_items),
-        spend_max_items: Some(s.config.spend_max_items),
-        spend_max_memo_bytes: Some(s.config.spend_max_memo_bytes),
+        max_request_bytes: cfg.max_request_bytes,
+        issue_max_items: Some(cfg.issue_max_items),
+        spend_max_items: Some(cfg.spend_max_items),
+        spend_max_memo_bytes: Some(cfg.spend_max_memo_bytes),
     };
     (
         StatusCode::OK,
@@ -186,7 +193,10 @@ pub fn fees_outcome(s: &FspState) -> Outcome {
 
 /// Run one issue on this thread (it calls the Issuer and writes files).
 pub fn run_issue(s: &FspState, request: &IssueRequest) -> Outcome {
-    let Some(service) = s.config.service() else {
+    // One snapshot of the settings for the whole issue: a reload during it
+    // applies to the next one.
+    let cfg = s.config.current();
+    let Some(service) = cfg.service() else {
         return error(503, "not_configured", "service.did is not set");
     };
     let Some(keypair) = s.service_keypair.as_ref() else {
@@ -201,12 +211,12 @@ pub fn run_issue(s: &FspState, request: &IssueRequest) -> Outcome {
     let ctx = IssueContext {
         service,
         service_keypair: keypair,
-        fee_per_byte: s.config.issue_fee_per_byte,
+        fee_per_byte: cfg.issue_fee_per_byte,
         current: &current,
         previous: previous.as_deref(),
         now: (s.clock)(),
-        esp_keyset_ttl_secs: s.config.esp_keyset_ttl_secs,
-        max_items: s.config.issue_max_items as usize,
+        esp_keyset_ttl_secs: cfg.esp_keyset_ttl_secs,
+        max_items: cfg.issue_max_items as usize,
     };
     let Ok(mut issues) = s.issues.lock() else {
         return error(500, sp_wire::codes::INTERNAL, "the issue lock is poisoned");
@@ -323,7 +333,7 @@ fn post_served<Q: DeserializeOwned>(
 /// `body` is the request body (empty for the reads). It runs on a blocking thread
 /// (an issue calls the ESP mint over AIR, and a spend waits for its batch).
 pub fn air_served(state: &FspState, kind: u8, body: &[u8]) -> Option<Served> {
-    let limit = state.config.max_request_bytes as usize;
+    let limit = state.config.current().max_request_bytes as usize;
     Some(match kind {
         KIND_MINT_INFO => served_of("mint info", health_outcome(state)),
         KIND_KEYS => served_of("keys", keys_outcome(state)),
@@ -376,6 +386,75 @@ async fn audit(State(s): State<Arc<FspState>>) -> (StatusCode, Json<Value>) {
     }
 }
 
+/// `POST /export-esp`: write the ESP this mint has kept to hand-over files in
+/// the export folder ([`crate::export::folder`]), under the issues Mutex that an
+/// issue also holds, and mark the notes exported. The body is empty and names no
+/// path: the files go where `serve` puts them, and `export-esp` moves them from
+/// there. The answer lists each file's name and number of notes.
+pub fn export_outcome(s: &FspState, now: u64) -> Outcome {
+    let Some(service) = s.config.current().service() else {
+        return error(503, "not_configured", "service.did is not set");
+    };
+    let Ok(mut issues) = s.issues.lock() else {
+        return error(500, sp_wire::codes::INTERNAL, "the issue lock is poisoned");
+    };
+    match crate::export::export_kept(
+        &mut issues,
+        &crate::export::folder(&s.data_dir),
+        service,
+        now,
+    ) {
+        Ok(files) => {
+            let files: Vec<Value> = files
+                .iter()
+                .map(|(file, notes)| {
+                    json!({
+                        "name": file.file_name().map(|n| n.to_string_lossy().into_owned()),
+                        "notes": notes,
+                    })
+                })
+                .collect();
+            (StatusCode::OK, json!({ "files": files }))
+        }
+        Err(why) => error(500, "export_failed", &why),
+    }
+}
+
+async fn export_route(State(s): State<Arc<FspState>>) -> (StatusCode, Json<Value>) {
+    // The issues Mutex is held across a whole issue (the calls to the Issuer
+    // included), so wait for it off the async threads.
+    let now = (s.clock)();
+    match tokio::task::spawn_blocking(move || export_outcome(&s, now)).await {
+        Ok((status, body)) => (status, Json(body)),
+        Err(e) => {
+            let (status, body) = error(
+                500,
+                sp_wire::codes::INTERNAL,
+                &format!("export task failed: {e}"),
+            );
+            (status, Json(body))
+        }
+    }
+}
+
+/// Read the settings again (`SIGHUP`) and put the ones that reload live into
+/// use: the fee and the limits, for the next request. The settings that need a
+/// restart keep their running values and are named in the result. If the new
+/// settings are not valid, nothing changes.
+pub fn reload(
+    s: &FspState,
+    base: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Reloaded, Vec<String>> {
+    let reloaded = s.config.reload(base, env)?;
+    let cfg = s.config.current();
+    s.spender.set_max_items(cfg.spend_max_items as usize);
+    s.spender
+        .set_max_memo_bytes(cfg.spend_max_memo_bytes as usize);
+    s.spender.set_max_batch(cfg.spend_max_batch as usize);
+    Ok(reloaded)
+}
+
 /// `GET /health` for the operator's health monitor (`sp-health-monitor.sh`,
 /// which runs on this machine). Wallets do not use it; they ask for the same
 /// document over AIR (mint info).
@@ -385,11 +464,13 @@ async fn health(State(s): State<Arc<FspState>>) -> (StatusCode, Json<Value>) {
 }
 
 /// The HTTP API that is left, on `server.bind` (loopback only): the operator's
-/// `GET /audit`, and `GET /health`, which the local health monitor calls (SPI-local
-/// traffic, like esp-mint's). Wallets do not use either; they use the AIR listener.
+/// `GET /audit` and `POST /export-esp` (which `fsp-mint export-esp` calls), and
+/// `GET /health`, which the local health monitor calls (SPI-local traffic, like
+/// esp-mint's). Wallets use none of them; they use the AIR listener.
 pub fn router(state: Arc<FspState>) -> Router {
     Router::new()
         .route("/audit", get(audit))
         .route("/health", get(health))
+        .route("/export-esp", post(export_route))
         .with_state(state)
 }

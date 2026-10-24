@@ -6,10 +6,11 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use fsp_mint::air_listener;
-use fsp_mint::config::{self, Config};
+use fsp_mint::config::{self, Config, ConfigCell};
 use fsp_mint::esp_air::AirIssuer;
 use fsp_mint::esp_client::{self, Issuer};
 use fsp_mint::issue::Issues;
+use fsp_mint::lock::{DataLock, LockError};
 use fsp_mint::server::{self, FspState};
 use fsp_mint::spend::Spender;
 use fsp_mint::store;
@@ -27,19 +28,32 @@ fsp-mint <command>
                        none, and print its public half for service.did.
   serve                Run the AIR listener (the only way wallets reach this mint:
                        mint info, keys, fees, rotation, issue and spend) and the
-                       operator's GET /audit and the health monitor's GET /health
-                       on server.bind (loopback only). Needs
-                       air.server and air.host (the listener's own AIR server)
-                       and, for the ESP mint, which is also reached over AIR
-                       only, air.esp_did, air.esp_server and air.esp_host. Asks
-                       the ESP mint which network it is on before it starts.
+                       operator's routes on server.bind (loopback only): GET
+                       /audit, GET /health for the health monitor and POST
+                       /export-esp for export-esp. Needs air.server and air.host
+                       (the listener's own AIR server) and, for the ESP mint,
+                       which is also reached over AIR only, air.esp_did,
+                       air.esp_server and air.esp_host. Asks the ESP mint which
+                       network it is on before it starts. Takes the data
+                       folder's writer lock: a second serve on the same folder
+                       is refused. SIGHUP reads the settings again; fees and
+                       limits change with no restart, and a setting that needs
+                       a restart is named and keeps its running value.
   audit [--json]       Print what the mint owes and holds: outstanding FSP per
                        key set and in total (in FSP units and PSP), and the ESP
                        in reserve, matured and unmatured. Reads the data files,
                        writes nothing, and works while serve runs.
-  export-esp --out DIR Write the ESP this mint has kept to DIR, one hand-over
+  export-esp --out DIR [--serve-only]
+                       Write the ESP this mint has kept to DIR, one hand-over
                        file per redeemable-after day, for the service's
-                       ecash-wallet to `receive` and `redeem`. Stop serve first.
+                       ecash-wallet to `receive` and `redeem`. Works while serve
+                       runs: it asks the running serve, which does the export
+                       between two issues. With no serve running it does the
+                       export itself, unless --serve-only: then it fails and
+                       touches nothing in the data folder (for a caller that
+                       runs as another account than serve). The files are
+                       readable by their owner only and each note is written
+                       once.
 
 Settings: fsp-mint.toml in FSP_DATA_DIR (default ~/.fsp-mint) or FSP_CONFIG,
 then FSP_... variables. Data lives in FSP_DATA_DIR/<network>.";
@@ -53,18 +67,36 @@ fn base_dir() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".fsp-mint"))
 }
 
-fn load_key(dir: &Path, cfg: &Config) -> Result<Keypair, String> {
-    let path = dir.join(KEY_FILE);
-    let text = std::fs::read_to_string(&path).map_err(|e| {
+/// The service key in `path`. An empty file is named as such (an older
+/// fsp-mint could leave one if it stopped while making the key); a file that
+/// holds anything but a whole key is damaged, and is never replaced here.
+fn read_key(path: &Path) -> Result<SecretKey, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
         format!(
             "cannot read {}: {e}. Run `fsp-mint service-key` first",
             path.display()
         )
     })?;
-    let sk = hex::decode(text.trim())
+    if text.is_empty() {
+        return Err(format!(
+            "{} is empty: no key was ever written in it. Run `fsp-mint service-key`, which makes it again",
+            path.display()
+        ));
+    }
+    hex::decode(text.trim())
         .ok()
         .and_then(|b| SecretKey::from_slice(&b).ok())
-        .ok_or_else(|| format!("{} is damaged", path.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "{} is damaged: it does not hold a whole key (64 hex digits). fsp-mint does not replace it: restore it from your backup, or, if no service ever used it, move it aside and run `fsp-mint service-key` again",
+                path.display()
+            )
+        })
+}
+
+fn load_key(dir: &Path, cfg: &Config) -> Result<Keypair, String> {
+    let path = dir.join(KEY_FILE);
+    let sk = read_key(&path)?;
     let kp = Keypair::from_secret_key(SECP256K1, &sk);
     // The whole DID is compared, the parity byte too: a DID that differs from
     // the key's only in 02 and 03 is another service.
@@ -131,24 +163,42 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "config" => {
             println!();
             for s in config::SPECS {
-                println!("{} ({}, default `{}`): {}", s.key, s.env, s.default, s.what);
+                println!(
+                    "{} ({}, default `{}`, {}): {}",
+                    s.key,
+                    s.env,
+                    s.default,
+                    if s.reload {
+                        "reloads live"
+                    } else {
+                        "needs a restart"
+                    },
+                    s.what
+                );
             }
             Ok(())
         }
         "service-key" => {
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             let path = dir.join(KEY_FILE);
+            // An empty file never held a key (an older fsp-mint could leave one
+            // if it stopped while making it), so it is made again. Any other
+            // file is kept as it is, damaged or not.
+            if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
+                std::fs::remove_file(&path)
+                    .map_err(|e| format!("cannot remove the empty {}: {e}", path.display()))?;
+                println!("{} was empty: making the key again", path.display());
+            }
             if !path.exists() {
                 let kp = Keypair::new(SECP256K1, &mut rand::rngs::OsRng);
-                store::write_secret(&path, &hex::encode(kp.secret_key().secret_bytes()))
-                    .map_err(|e| e.to_string())?;
-                println!("made {}", path.display());
+                match store::write_secret(&path, &hex::encode(kp.secret_key().secret_bytes())) {
+                    Ok(()) => println!("made {}", path.display()),
+                    // Another `service-key` made it meanwhile: that key is the one.
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(format!("cannot write {}: {e}", path.display())),
+                }
             }
-            let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            let sk = hex::decode(text.trim())
-                .ok()
-                .and_then(|b| SecretKey::from_slice(&b).ok())
-                .ok_or_else(|| format!("{} is damaged", path.display()))?;
+            let sk = read_key(&path)?;
             println!(
                 "service.did = {}",
                 ServiceDid::from(Keypair::from_secret_key(SECP256K1, &sk).public_key())
@@ -173,8 +223,58 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Some(i) if i + 1 < args.len() => PathBuf::from(&args[i + 1]),
                 _ => return Err("export-esp needs --out DIR".into()),
             };
+            // Anything else is refused, so that a mistyped --serve-only is never
+            // taken as "export by yourself".
+            let mut rest = args[1..].iter();
+            while let Some(a) = rest.next() {
+                match a.as_str() {
+                    "--out" => {
+                        rest.next();
+                    }
+                    "--serve-only" => {}
+                    other => return Err(format!("export-esp does not take `{other}`")),
+                }
+            }
             let service = cfg.service().ok_or("service.did is not set")?;
-            let written = fsp_mint::export::export_esp(&dir, &out, service, fsp_mint::now_secs())?;
+            let from = fsp_mint::export::folder(&dir);
+            let bind = cfg.bind.clone();
+            if args.iter().any(|a| a == "--serve-only") {
+                // Only the running serve exports: no lock is taken and no data
+                // file is opened or made here, so a caller running as another
+                // account (aso's redeem job, as root) cannot leave a file in the
+                // data folder that serve's account cannot write.
+                println!("asking the running fsp-mint serve to export (--serve-only)");
+                fsp_mint::export::ask_serve(&bind, &|e| {
+                    format!(
+                        "export-esp --serve-only: fsp-mint serve is not answering at {bind}: {e}. Nothing was exported and the data folder was not touched. Start serve and run this again"
+                    )
+                })?;
+            } else {
+                // A running serve holds the writer lock and has issues.json in
+                // memory, so it does the export. With none running the lock is
+                // taken here, so that none can start meanwhile.
+                match DataLock::acquire(&dir) {
+                    Ok(_lock) => {
+                        let mut issues = Issues::open(&dir).map_err(|e| e.to_string())?;
+                        fsp_mint::export::export_kept(
+                            &mut issues,
+                            &from,
+                            service,
+                            fsp_mint::now_secs(),
+                        )?;
+                    }
+                    Err(LockError::Held(_)) => {
+                        println!("fsp-mint serve is running: asking it to export");
+                        fsp_mint::export::ask_serve(&bind, &|e| {
+                            format!(
+                                "the data folder is in use by another fsp-mint, but nothing answers at {bind}: {e}. If that is another `export-esp`, run this again in a moment; otherwise check that `fsp-mint serve` has the same settings"
+                            )
+                        })?;
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+            let written = fsp_mint::export::deliver(&from, &out)?;
             for (file, notes) in &written {
                 println!("wrote {} ({notes} notes)", file.display());
             }
@@ -184,6 +284,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
             Ok(())
         }
         "serve" => {
+            // One process writes the data folder: take its lock before anything
+            // is opened, and keep it until this process ends. A second serve is
+            // refused here, however it is set up.
+            let _lock = DataLock::acquire(&dir).map_err(|e| e.to_string())?;
+            // The signals come first. From here on SIGHUP is a request to read
+            // the settings again, not the end of the process; one that arrives
+            // while serve is starting waits in the channel until serve is up.
+            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+            let mut hangups = listen_for_sighup(&rt)?;
             // The ESP mint is reached over AIR only: without its DID and the
             // AIR server, serve does not start.
             cfg.require_air()?;
@@ -220,7 +329,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 ));
             }
             let state = Arc::new(FspState {
-                config: cfg,
+                config: ConfigCell::new(cfg),
+                data_dir: dir.clone(),
                 spender,
                 issues: Mutex::new(issues),
                 issuer: Box::new(issuer),
@@ -228,7 +338,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 clock: Box::new(fsp_mint::now_secs),
             });
             start_air_listener(air, did_key, Arc::clone(&state))?;
-            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+            let reloading = Arc::clone(&state);
+            let settings_base = base.clone();
+            rt.spawn(async move {
+                while hangups.recv().await.is_some() {
+                    let (state, base) = (Arc::clone(&reloading), settings_base.clone());
+                    let _ =
+                        tokio::task::spawn_blocking(move || reload_and_say(&state, &base)).await;
+                }
+            });
             rt.block_on(async move {
                 let listener = tokio::net::TcpListener::bind(&bind)
                     .await
@@ -287,6 +405,60 @@ fn start_air_listener(
         .map_err(|e| e.to_string())?;
     println!("AIR listener starting");
     Ok(())
+}
+
+/// Turn SIGHUP into messages on a channel. The signal is registered before this
+/// returns, so that none that follows ends the process.
+fn listen_for_sighup(
+    rt: &tokio::runtime::Runtime,
+) -> Result<tokio::sync::mpsc::UnboundedReceiver<()>, String> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut hangup = rt
+        .block_on(async { signal(SignalKind::hangup()) })
+        .map_err(|e| format!("cannot listen for SIGHUP: {e}"))?;
+    let (send, receive) = tokio::sync::mpsc::unbounded_channel();
+    rt.spawn(async move {
+        while hangup.recv().await.is_some() {
+            if send.send(()).is_err() {
+                return;
+            }
+        }
+    });
+    Ok(receive)
+}
+
+/// SIGHUP: read the settings again and say what happened. The environment is the
+/// one the process started with, so it is the settings file that can change.
+fn reload_and_say(state: &FspState, base: &Path) {
+    let env = |n: &str| std::env::var(n).ok();
+    match server::reload(state, base, &env) {
+        Ok(reloaded) => {
+            println!("fsp-mint: SIGHUP, settings read again:");
+            for line in &reloaded.lines {
+                println!("{line}");
+            }
+            if reloaded.changed.is_empty() {
+                println!("fsp-mint: no setting that reloads live has changed");
+            } else {
+                println!(
+                    "fsp-mint: now in use, from the next request: {}",
+                    reloaded.changed.join(", ")
+                );
+            }
+            if !reloaded.needs_restart.is_empty() {
+                println!(
+                    "fsp-mint: {} need a restart, which is a brief downtime, so they keep their running values until fsp-mint is restarted",
+                    reloaded.needs_restart.join(", ")
+                );
+            }
+        }
+        Err(problems) => {
+            eprintln!("fsp-mint: SIGHUP, the settings are not valid, so none changed:");
+            for problem in problems {
+                eprintln!("  {problem}");
+            }
+        }
+    }
 }
 
 fn print_audit(r: &fsp_mint::audit::Report) {
