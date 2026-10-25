@@ -2,6 +2,10 @@
 
 fsp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.8.2 (2026-10-25): the tests run against esp-mint v0.9.0; mint-core v0.3.0 (ROADMAP item 31, P1-02)
+
+**Pins only.** mint-core, mint-types and bdhke are `v0.3.0`, `sp-wire` is `v0.5.2` and the dev-dependency `esp-mint` is `v0.9.0`. fsp-mint never read the totals of a store, and its own sums (`issued`, `kept`) are its own types: no code changed. esp-mint's `/audit` now gives `issued`, `redeemed` and `outstanding` as decimal strings; the tests that read `redeemed` already accepted a number or a string. A clean break for the data of esp-mint 0.8.x, which does not open under 0.9.0, and none for fsp-mint's own data folder. README line 7 names the new pins. No wire change.
+
 ## 0.8.1 (2026-10-25): the tests run against esp-mint v0.8.2 (ROADMAP item 31)
 
 **The dev-dependency `esp-mint` is `v0.8.2`** (it named `v0.8.0`), so the tests start an esp-mint with the item 31 fixes: a refused burn drops the pending exchange (P1-01, 0.8.1), a burn proof serves only its own request, no output is signed twice and a transfer no longer panics (P2-01, P1-07, 0.8.2). The committed `Cargo.lock` follows; README's pin follows. The mint does not link esp-mint: no code change. Tests: 78, unchanged.
