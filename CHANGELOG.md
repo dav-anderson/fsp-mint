@@ -2,6 +2,10 @@
 
 fsp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.8.1 (2026-10-25): the tests run against esp-mint v0.8.2 (ROADMAP item 31)
+
+**The dev-dependency `esp-mint` is `v0.8.2`** (it named `v0.8.0`), so the tests start an esp-mint with the item 31 fixes: a refused burn drops the pending exchange (P1-01, 0.8.1), a burn proof serves only its own request, no output is signed twice and a transfer no longer panics (P2-01, P1-07, 0.8.2). The committed `Cargo.lock` follows; README's pin follows. The mint does not link esp-mint: no code change. Tests: 78, unchanged.
+
 ## 0.8.0 (2026-10-23): export-esp while serve runs, the writer lock, SIGHUP reload
 
 - **New: `export-esp` works while `serve` runs (ROADMAP item 20, "fsp-mint must never stop").** The command asks the running `serve` on `POST /export-esp` (loopback, `server.bind`), which exports under the issues Mutex (`export::export_kept`, `server::export_outcome`), so an issue and an export never overlap and no note is exported twice or missed. With no `serve` running the command takes the lock and does it itself. Files are made in `<data folder>/export/` (0700; files 0600; the route takes no path) and moved to `--out`. Crash-safe: files as `.part`, one atomic save of the marks, then the final names; a leftover `.part` is finished or deleted by the next export. `export::export_esp(data, out, service, now)` is replaced by `export_kept`, `deliver`, `folder` and `ask_serve`. The usage text, README and `export.rs` no longer say to stop `serve`.
