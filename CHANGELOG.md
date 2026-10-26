@@ -2,6 +2,10 @@
 
 fsp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.9.0 (2026-10-26): sp-wire v0.6.0, wire version 4 (PSP claim rework, pass 2)
+
+**Pins and docs only; no code changed.** `sp-wire` is `v0.6.0` (it was `v0.5.2`), whose `WIRE_VERSION` is 4, and the dev-dependency `esp-mint` is `v0.10.0` (it was `v0.9.0`), so one sp-wire is built. The PSP's purchase became a claim in pass 1 (psp-mint 0.8.0); fsp-mint has no part in it. Its mint info now reports `wire_version` 4 (it follows `sp_wire::WIRE_VERSION`), which a wallet of wire version 3 refuses: that is why this is a minor version. README: the pins and wire version 4.
+
 ## 0.8.2 (2026-10-25): the tests run against esp-mint v0.9.0; mint-core v0.3.0 (ROADMAP item 31, P1-02)
 
 **Pins only.** mint-core, mint-types and bdhke are `v0.3.0`, `sp-wire` is `v0.5.2` and the dev-dependency `esp-mint` is `v0.9.0`. fsp-mint never read the totals of a store, and its own sums (`issued`, `kept`) are its own types: no code changed. esp-mint's `/audit` now gives `issued`, `redeemed` and `outstanding` as decimal strings; the tests that read `redeemed` already accepted a number or a string. A clean break for the data of esp-mint 0.8.x, which does not open under 0.9.0, and none for fsp-mint's own data folder. README line 7 names the new pins. No wire change.
