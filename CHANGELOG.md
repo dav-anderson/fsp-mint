@@ -2,6 +2,14 @@
 
 fsp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.10.0 (2026-10-27): the key set stream and the keyset ID over every key (ROADMAP item 31, finding P2-04), sp-wire v0.7.0, wire version 5
+
+- **Changed: the keyset ID is `sp_wire::keyset::keyset_id`** (tag `psp-mint/keyset-id/v2`) over all 64 (amount, key) pairs. It was the first 8 bytes of a hash of the 1-unit key alone (tag `fsp-mint/keyset-id/v1`); that hash and its private constant `ID_TAG` are removed. Every keyset's ID changes, so a note signed under an old ID is not found: this is the same break as wire version 5 and there is no pre-release compatibility. The keys themselves are unchanged (they derive from the same secret), so an existing `keysets.json` loads and gives the new ID. The keyset for secret `[7; 32]` has ID `9d32ce81e9f2e9d3` (it was `90312438136ea6fa`).
+- **New: the key set stream.** `fsp_mint::stream::live_records` and `fsp_mint::stream::pass`, `Keyset::stream_record`, and a `stream` thread in `serve` publish each keyset (the epoch and 64 keys) as a record of a stream under the service's DID on AIR, with `sp_wire::air_request::stream::KeysetPublisher`: a pass every 5 seconds that does nothing while the live keysets are the ones it last published and otherwise writes the missing ones; a failed pass is retried after 30 seconds and never stops the mint. The mint keeps no state for it. No new setting.
+- **Changed: pins.** `sp-wire` `v0.7.0` (wire version 5); the dev-dependency `esp-mint` is `v0.11.0`. mint-core is unchanged.
+- Public items added: `fsp_mint::stream` (module), `Keyset::stream_record`. None removed (`ID_TAG` was private).
+- Tests: 78 before, 81 after (3 added). `keysets.rs` +2 (`the_id_is_the_shared_one_over_every_key`, `the_stream_record_is_the_keyset`), `tests/fsp_flow.rs` +1 (`the_key_set_stream_holds_every_keyset_and_the_last_two_are_current_and_previous`).
+
 ## 0.9.0 (2026-10-26): sp-wire v0.6.0, wire version 4 (PSP claim rework, pass 2)
 
 **Pins and docs only; no code changed.** `sp-wire` is `v0.6.0` (it was `v0.5.2`), whose `WIRE_VERSION` is 4, and the dev-dependency `esp-mint` is `v0.10.0` (it was `v0.9.0`), so one sp-wire is built. The PSP's purchase became a claim in pass 1 (psp-mint 0.8.0); fsp-mint has no part in it. Its mint info now reports `wire_version` 4 (it follows `sp_wire::WIRE_VERSION`), which a wallet of wire version 3 refuses: that is why this is a minor version. README: the pins and wire version 4.

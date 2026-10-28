@@ -1,8 +1,10 @@
 //! The FSP signing keys.
 //!
 //! A keyset is a 32-byte secret. The key for each power-of-two amount is
-//! derived from it, and its id (16 hex characters) is a hash of its key for 1
-//! unit, so a wallet can tell which keyset signed a note.
+//! derived from it, and its id (16 hex characters) is `sp_wire::keyset::keyset_id`
+//! over all 64 (amount, key) pairs, the same function the PSP mint and the wallet
+//! use, so a wallet can tell which keyset signed a note and that two keysets which
+//! differ in any one key have different ids.
 //!
 //! **Rotation.** At genesis there is one keyset (epoch 0) and one spent list.
 //! Rotation is off while `rotation.activation_hours` is 0, and until the first
@@ -26,6 +28,7 @@ use rand::rngs::OsRng;
 use secp256k1::{PublicKey, SECP256K1, SecretKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sp_wire::air_request::stream::KeysetRecord;
 
 use crate::store;
 
@@ -40,7 +43,6 @@ use crate::store;
 pub const RETIRED_KEYSETS_CAP: usize = 131_072;
 pub const FILE_NAME: &str = "keysets.json";
 const KEY_TAG: &[u8] = b"fsp-mint/key/v1";
-const ID_TAG: &[u8] = b"fsp-mint/keyset-id/v1";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredSet {
@@ -88,6 +90,14 @@ fn derive(secret: &[u8; 32], units: u64) -> SecretKey {
     unreachable!("256 consecutive hashes outside the curve order")
 }
 
+/// `public` keyed by `Amount`, which is how `sp_wire` names a keyset's keys.
+fn amounts(public: &BTreeMap<u64, PublicKey>) -> BTreeMap<Amount, PublicKey> {
+    public
+        .iter()
+        .map(|(units, key)| (Amount::from_units(*units), *key))
+        .collect()
+}
+
 impl Keyset {
     fn from_secret(epoch: u64, secret: [u8; 32]) -> Self {
         let keys: Vec<SecretKey> = (0..64).map(|bit| derive(&secret, 1u64 << bit)).collect();
@@ -96,10 +106,7 @@ impl Keyset {
             .enumerate()
             .map(|(bit, k)| (1u64 << bit, k.public_key(SECP256K1)))
             .collect::<BTreeMap<_, _>>();
-        let mut h = Sha256::new();
-        h.update(ID_TAG);
-        h.update(public[&1].serialize());
-        let id = hex::encode(&h.finalize()[..8]);
+        let id = sp_wire::keyset::keyset_id(&amounts(&public));
         Keyset {
             epoch,
             id,
@@ -113,6 +120,16 @@ impl Keyset {
         let mut secret = [0u8; 32];
         OsRng.fill_bytes(&mut secret);
         Self::from_secret(epoch, secret)
+    }
+
+    /// The record of this keyset in the mint's key set stream: its epoch and
+    /// the key for every power of two (`sp_wire::air_request::stream`). Its
+    /// `id()` is this keyset's `id`.
+    pub fn stream_record(&self) -> KeysetRecord {
+        KeysetRecord {
+            epoch: self.epoch,
+            keys: amounts(&self.public),
+        }
     }
 
     /// The signing key for a power-of-two amount, or `None` for any other.
@@ -331,6 +348,39 @@ fn trim(list: &mut Vec<String>, keep: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The keyset of the secret `[7; 32]`: its id is `keyset_id` over all 64
+    /// keys, worked out outside this crate (SHA-256 of the tag
+    /// `psp-mint/keyset-id/v2`, then for each power of two its 8 bytes big-endian
+    /// and its 33-byte key). Fails if the id goes back to the key for 1 unit
+    /// alone (the old form, `90312438136ea6fa` for this secret), if the tag or the
+    /// order of the pairs changes, or if the keys derive differently.
+    #[test]
+    fn the_id_is_the_shared_one_over_every_key() {
+        let k = Keyset::from_secret(0, [7u8; 32]);
+        assert_eq!(k.id, "9d32ce81e9f2e9d3");
+        assert_ne!(k.id, "90312438136ea6fa", "the old, 1-unit-only id");
+        assert_eq!(
+            hex::encode(k.public[&1].serialize()),
+            "021d1fd0b12a9755208843b81ec13d38ceed3ddf06720956d585c401b7c5739087"
+        );
+        assert_eq!(
+            hex::encode(k.public[&(1u64 << 63)].serialize()),
+            "02da2f550f8b3c601056df0d51107932be40b5cdefc7194b020014085f1915f953"
+        );
+    }
+
+    /// The stream record of a keyset carries its epoch and all 64 keys, and its
+    /// id is the keyset's id. Fails if a key is left out or the epoch is wrong.
+    #[test]
+    fn the_stream_record_is_the_keyset() {
+        let k = Keyset::from_secret(3, [7u8; 32]);
+        let r = k.stream_record();
+        assert_eq!(r.epoch, 3);
+        assert_eq!(r.keys.len(), 64);
+        assert_eq!(r.id(), "9d32ce81e9f2e9d3");
+        assert_eq!(r.keys[&Amount::from_units(1 << 5)], k.public[&(1 << 5)]);
+    }
 
     fn dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("fsp-keysets-{name}-{}", {

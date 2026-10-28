@@ -2616,3 +2616,88 @@ fn serve_refuses_a_bind_that_is_not_loopback() {
     c.set("server.bind", "127.0.0.1:3200").unwrap();
     c.validate().unwrap();
 }
+
+/// The key set stream: every keyset the mint makes is on AIR, in epoch order,
+/// and a wallet reading it from the DID alone sees the last two as the current
+/// and the previous keyset, with the keys `GET /keys` gives. Fails if a keyset
+/// is not published, is published twice, is published under the wrong DID or
+/// carries a key other than the one the mint signs with, or if a rotation does
+/// not add a record.
+#[test]
+fn the_key_set_stream_holds_every_keyset_and_the_last_two_are_current_and_previous() {
+    use sp_wire::air_request::stream::{KeysetPublisher, read_keyset_tail};
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("stream");
+    let (esp_at, _esp) = start_esp(&rt, &dir);
+    // Activation 120 hours after the first issue (NOW), period 240 hours.
+    let f = start_fsp(&rt, &dir, &esp_at, "120");
+    let mut publisher = KeysetPublisher::new(esp_at.server.clone(), 10, &service_air_key());
+    // `service()` is per thread: take it here, not on the runtime's thread.
+    let mint = service();
+    let wallet_view = || {
+        block_on_new_runtime(|| async {
+            let wallet = client::connect(&esp_at.server).await.unwrap();
+            read_keyset_tail(&wallet, &mint, 10).await.unwrap()
+        })
+        .unwrap()
+    };
+    let genesis = current(&f);
+
+    // start: epoch 0 only
+    let said = fsp_mint::stream::pass(&mut publisher, &f.state.spender, NOW)
+        .unwrap()
+        .unwrap();
+    assert!(
+        said.contains("wrote record(s) [0]") && said.contains("1 record(s)"),
+        "{said}"
+    );
+    let view = wallet_view();
+    assert_eq!(view.end, 1);
+    assert_eq!(view.last.len(), 1);
+    assert_eq!(view.last[0].0, 0);
+    assert_eq!(view.last[0].1.id(), genesis.id);
+    assert_eq!(view.last[0].1.epoch, 0);
+    // nothing changed: nothing written
+    assert_eq!(
+        fsp_mint::stream::pass(&mut publisher, &f.state.spender, NOW).unwrap(),
+        None
+    );
+
+    // the first rotation, 5 days in: epoch 1 is current, epoch 0 previous
+    let t = NOW + 5 * 86_400;
+    f.clock.store(t, Ordering::SeqCst);
+    let said = fsp_mint::stream::pass(&mut publisher, &f.state.spender, t)
+        .unwrap()
+        .unwrap();
+    assert!(
+        said.contains("wrote record(s) [1]") && said.contains("2 record(s)"),
+        "{said}"
+    );
+    let keys: KeysResponse = f.get_as("/keys");
+    let view = wallet_view();
+    assert_eq!(view.end, 2);
+    assert_eq!(
+        view.last
+            .iter()
+            .map(|(i, r)| (*i, r.id()))
+            .collect::<Vec<_>>(),
+        vec![(0, genesis.id.clone()), (1, keys.current.clone())]
+    );
+    assert_eq!(keys.previous.as_deref(), Some(genesis.id.as_str()));
+    // every published key is the key `/keys` gives for that amount
+    for (_, record) in &view.last {
+        let served = &keys.keysets[&record.id()];
+        assert_eq!(record.keys.len(), 64);
+        for (amount, key) in &record.keys {
+            assert_eq!(served[&amount.units], *key, "{amount:?}");
+        }
+    }
+
+    // a restarted mint (a publisher that remembers nothing) writes nothing
+    let mut restarted = KeysetPublisher::new(esp_at.server.clone(), 10, &service_air_key());
+    assert_eq!(
+        fsp_mint::stream::pass(&mut restarted, &f.state.spender, t).unwrap(),
+        None
+    );
+    assert_eq!(wallet_view().end, 2);
+}

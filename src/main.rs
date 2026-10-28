@@ -337,6 +337,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 service_keypair: Some(keypair),
                 clock: Box::new(fsp_mint::now_secs),
             });
+            start_stream(&air, &did_key, Arc::clone(&state))?;
             start_air_listener(air, did_key, Arc::clone(&state))?;
             let reloading = Arc::clone(&state);
             let settings_base = base.clone();
@@ -404,6 +405,42 @@ fn start_air_listener(
         })
         .map_err(|e| e.to_string())?;
     println!("AIR listener starting");
+    Ok(())
+}
+
+/// Start the key set stream's thread: every few seconds it publishes the live
+/// keysets on AIR if the stream does not hold them yet (`fsp_mint::stream`). A
+/// failure is printed and tried again later; it never stops the mint.
+fn start_stream(
+    air: &air_listener::Settings,
+    key: &sp_wire::seal::SecretKey,
+    state: Arc<FspState>,
+) -> Result<(), String> {
+    use sp_wire::air_request::stream::{KeysetPublisher, RETRY_SECS, TICK_SECS};
+    let mut publisher = KeysetPublisher::new(air.server.clone(), air.timeout_secs, key);
+    std::thread::Builder::new()
+        .name("stream".into())
+        .spawn(move || {
+            loop {
+                let wait =
+                    match fsp_mint::stream::pass(&mut publisher, &state.spender, (state.clock)()) {
+                        Ok(said) => {
+                            if let Some(said) = said {
+                                println!("{said}");
+                            }
+                            TICK_SECS
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "key set stream: not published, will retry in {RETRY_SECS} s: {e}"
+                            );
+                            RETRY_SECS
+                        }
+                    };
+                std::thread::sleep(std::time::Duration::from_secs(wait));
+            }
+        })
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 

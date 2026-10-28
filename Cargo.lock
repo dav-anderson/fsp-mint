@@ -609,8 +609,8 @@ dependencies = [
 
 [[package]]
 name = "esp-mint"
-version = "0.10.0"
-source = "git+https://github.com/dav-anderson/esp-mint.git?tag=v0.10.0#9c93a976459c224c6674ae23a3b25307b7177045"
+version = "0.11.0"
+source = "git+https://github.com/dav-anderson/esp-mint.git?tag=v0.11.0#c570c0d35410763c95c3e44c33aa5ff723f3de14"
 dependencies = [
  "axum",
  "bdhke",
@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "fsp-mint"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "bdhke",
@@ -2166,8 +2166,8 @@ dependencies = [
 
 [[package]]
 name = "sp-wire"
-version = "0.6.0"
-source = "git+https://github.com/dav-anderson/sp-wire.git?tag=v0.6.0#cb8a9cd47bd0db8e00be8b7ff3a394d0f06847d9"
+version = "0.7.0"
+source = "git+https://github.com/dav-anderson/sp-wire.git?tag=v0.7.0#5d2ba81f36f011145bf2e5592423f9a40c1b54ed"
 dependencies = [
  "air",
  "air_server",

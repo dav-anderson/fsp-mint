@@ -86,7 +86,17 @@ Two figures, both counted where the thing happens, so that a crash cannot leave 
 
 The request and response bodies (`IssueRequest`, `SpendRequest` and the rest of `src/api.rs`), their hashes and digests, the size helper `issue_group_size` and the error codes are defined in the `sp-wire` crate, not here. `src/api.rs` re-exports them, so `fsp_mint::api::*` is unchanged. The transfer request this mint sends to the ESP mint is the `sp-wire` type too. The wallet and the other mints build against the same crate, so they cannot drift from this mint by a byte.
 
-The mint info (AIR kind 1, and `GET /health` on loopback) returns `wire_version`, the crate's `WIRE_VERSION`. **Changing any encoded byte or JSON field in `sp-wire` means bumping `WIRE_VERSION`**, and a wallet refuses a mint that reports another number. Golden-bytes and size tests in `sp-wire` fail if a byte moves.
+The mint info (AIR kind 1, and `GET /health` on loopback) returns `wire_version`, the crate's `WIRE_VERSION`. **Changing any encoded byte or JSON field in `sp-wire` means bumping `WIRE_VERSION`**, and a wallet refuses a mint that reports another number. Version 5 is the keyset ID over every key and the key set stream. Golden-bytes and size tests in `sp-wire` fail if a byte moves.
+
+## The key set stream
+
+A mint that signs one user's outputs with a key it uses for that user alone can recognise that user's notes when they come back (ROADMAP item 31, finding P2-04, the mint fingerprinting attack). So the wallet must see the keys the mint really publishes and check each key in each reply against them. fsp-mint publishes each keyset it makes as one record of a stream under the service's DID on its AIR server (`src/stream.rs`; the cells, the record and the publisher `KeysetPublisher` are `sp_wire::air_request::stream`): the epoch and the key for each of the 64 powers of two, 2,636 bytes, in epoch order. The stream cell is the DID key moved by a tweak of the cell's name, so anyone can compute the address and read it and only this mint can write it. A wallet reads the last two records as the current and the previous keyset and accepts a key only if it is the key for its amount in one of them.
+
+The keyset ID is now `sp_wire::keyset::keyset_id` (tag `psp-mint/keyset-id/v2`): the first 8 bytes of the hash of every (amount, key) pair, the function the PSP mint and the wallet use. fsp-mint's own hash of the 1-unit key and its tag `fsp-mint/keyset-id/v1` are gone, so a keyset's ID commits to all 64 keys and two keysets that differ in one key have different IDs. An ID of the old form is not accepted anywhere (wire version 5).
+
+`serve` runs a thread, `stream`, that asks the spender for the live keysets every 5 seconds (which also makes a rotation that is due) and, when they are not the ones it last published, reads the end of the stream and its last two records and writes the ones that are missing. It keeps nothing on disk: the stream is its memory, so a restart, a crash between two writes or a write that was not acknowledged is mended by the next pass, and a record is never written twice. A failed pass is printed and tried again after 30 seconds; it never stops the mint. No setting: the thread uses `air.server`, `air.host` and `air.timeout_secs`.
+
+AIR has no delete, so the stream only grows, one record for each rotation. `rotation.period_hours` is 1 to 876000 (default 8760), so an operator who sets it to 1 makes about 8,760 records (23 MB) a year; this is a limit that AIR gives and fsp-mint has no cap setting for it (listed as an ASK in the P2-04 report). Signed keysets, a threshold of AIR servers and punishment for a mint that tags are ROADMAP item 34 and are not built.
 
 ## Key rotation
 

@@ -14,6 +14,7 @@
 //! - [`lock`]: the data folder's writer lock: one fsp-mint process writes it at a time.
 //! - [`server`]: what the mint answers (an outcome function per call) and the
 //!   HTTP routes left: `GET /audit`, `GET /health` and `POST /export-esp`.
+//! - [`stream`]: the key set stream, the live keysets published on AIR so that every wallet sees the same keys.
 //! - [`air_listener`]: this mint's own AIR listener, the only way wallets reach it.
 
 pub mod air_listener;
@@ -29,6 +30,7 @@ pub mod lock;
 pub mod server;
 pub mod spend;
 pub mod store;
+pub mod stream;
 
 /// Seconds since the Unix epoch.
 pub fn now_secs() -> u64 {
